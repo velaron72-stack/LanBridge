@@ -24,6 +24,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -36,9 +37,13 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import app.lanbridge.core.Native
 import app.lanbridge.core.Prefs
 import kotlinx.coroutines.Dispatchers
@@ -52,42 +57,60 @@ private const val HELP_TEXT =
         "3. Оба нажимают «Подключиться» с разницей не больше минуты.\n" +
         "4. Когда статус «Подключено», запускайте игру: друг виден как устройство в локальной сети.\n\n" +
         "Как это устроено\n" +
-        "Создаётся виртуальная сеть 192.168.x.0/24 из двух адресов. Адреса, открытые ключи и тип NAT " +
-        "передаются в коде, сервера нет (STUN используется только чтобы узнать внешний адрес). " +
-        "Соединение прямое (UDP hole punching), трафик шифруется: X25519, ChaCha20-Poly1305. " +
-        "Broadcast и multicast пересылаются другу, поэтому игры, ищущие друг друга по LAN, видят его.\n\n" +
+        "Создаётся виртуальная сеть 192.168.x.0/24 из двух адресов. Дополнительно туннель зеркалирует реальные " +
+        "адреса устройств (например, адрес Wi-Fi): игры, которые привязываются к реальному адресу или сообщают " +
+        "его другому игроку, продолжают работать. Адреса, открытые ключи и тип NAT передаются в коде, сервера нет " +
+        "(STUN нужен только чтобы узнать внешний адрес). Соединение прямое (UDP hole punching), трафик " +
+        "шифруется: X25519, ChaCha20-Poly1305. Broadcast и multicast пересылаются другу, поэтому игры, " +
+        "ищущие друг друга по LAN, видят его.\n\n" +
         "Если не соединяется\n" +
         "• Коды живут ограниченное время: создайте заново.\n" +
-        "• Пароль комнаты должен совпадать у обоих.\n" +
+        "• У обоих должна быть версия 2.0.0 или новее.\n" +
         "• Если NAT симметричный у обоих, прямое соединение невозможно: подключитесь к одному Wi-Fi " +
         "или раздайте точку доступа.\n" +
         "• Отключите другие VPN: Android разрешает только один.\n\n" +
+        "Если игра не стартует\n" +
+        "Сразу после неудачной попытки откройте «Журнал и потоки» (значок с ключом) на обоих устройствах и " +
+        "нажмите «Копировать»: там видно, какой трафик игры проходит через туннель и что отбрасывается. " +
+        "«Проверка LAN» на экране подключения показывает, проходят ли unicast, broadcast, multicast, " +
+        "большие UDP-пакеты и TCP.\n\n" +
         "Ограничения\n" +
         "• Туннель на уровне IPv4 без root. Игры, привязанные к интерфейсу Wi-Fi или использующие не-IP " +
         "протоколы, не заработают.\n\n" +
         "Работа в фоне\n" +
-        "Xiaomi, Huawei/Honor, Oppo/Realme, Vivo, Samsung часто закрывают фоновые сервисы. Разрешите " +
-        "автозапуск, снимите ограничение батареи и закрепите приложение в списке недавних."
+        "Xiaomi, Huawei/Honor, Oppo/Realme, Vivo, Samsung часто закрывают фоновые службы. Разрешите " +
+        "автозапуск, снимите ограничение батареи (Настройки → Фоновая работа) и закрепите приложение в " +
+        "списке недавних."
+
+/** Shown on every launch of the app. */
+@Composable
+fun StartupDialog(onOk: () -> Unit, onSettings: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onOk,
+        title = { Text("Приложение в разработке") },
+        text = {
+            Text(
+                "LanBridge проходит тестирование. Возможны сбои и неполная совместимость с играми.\n\n" +
+                    "Чтобы туннель не останавливался в фоне, отключите оптимизацию батареи и разрешите работу " +
+                    "в фоновом режиме в настройках.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        },
+        confirmButton = { TextButton(onClick = onOk) { Text("ОК") } },
+        dismissButton = { TextButton(onClick = onSettings) { Text("Настройки") } },
+    )
+}
 
 @Composable
 fun HelpDialog(onDismiss: () -> Unit) {
     val ctx = LocalContext.current
-    val ignoring = remember { SysActions.isIgnoringBatteryOptimizations(ctx) }
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("Закрыть") } },
-        title = { Text("Справка") },
+        title = { Text("Справка · ${SysActions.versionName(ctx)}") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(HELP_TEXT, style = MaterialTheme.typography.bodyMedium)
-                OutlinedButton(
-                    onClick = { SysActions.requestIgnoreBatteryOptimizations(ctx) },
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text(if (ignoring) "Оптимизация батареи уже отключена" else "Отключить оптимизацию батареи") }
-                OutlinedButton(
-                    onClick = { if (!SysActions.openAutostart(ctx)) SysActions.appSettings(ctx) },
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("Автозапуск и фоновая работа") }
             }
         },
     )
@@ -102,6 +125,18 @@ fun SettingsDialog(onDismiss: () -> Unit) {
     var mtu by remember { mutableStateOf(prefs.mtu.toString()) }
     var ttl by remember { mutableStateOf(prefs.ttlMin.toString()) }
     var awake by remember { mutableStateOf(prefs.keepAwake) }
+
+    // The battery state changes in a system screen: re-read it every time the app comes back to the foreground.
+    var ignoring by remember { mutableStateOf(SysActions.isIgnoringBatteryOptimizations(ctx)) }
+    val owner = LocalLifecycleOwner.current
+    DisposableEffect(owner) {
+        val obs = LifecycleEventObserver { _, e ->
+            if (e == Lifecycle.Event.ON_RESUME) ignoring = SysActions.isIgnoringBatteryOptimizations(ctx)
+        }
+        owner.lifecycle.addObserver(obs)
+        onDispose { owner.lifecycle.removeObserver(obs) }
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
@@ -118,6 +153,39 @@ fun SettingsDialog(onDismiss: () -> Unit) {
         title = { Text("Настройки") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Фоновая работа",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    if (ignoring) "Оптимизация батареи отключена" else "Оптимизация батареи включена: система может остановить туннель",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (ignoring) okColor() else warnColor(),
+                )
+                OutlinedButton(
+                    onClick = { SysActions.requestIgnoreBatteryOptimizations(ctx) },
+                    enabled = !ignoring,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Отключить оптимизацию батареи") }
+                OutlinedButton(
+                    onClick = { if (!SysActions.openAutostart(ctx)) SysActions.appSettings(ctx) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Разрешить работу в фоне") }
+                Text(
+                    "Xiaomi, Huawei/Honor, Oppo/Realme, Vivo, Samsung: включите автозапуск, в разделе «Батарея» " +
+                        "выберите «Без ограничений» и закрепите приложение в списке недавних.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Соединение",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold,
+                )
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
@@ -159,7 +227,7 @@ fun SettingsDialog(onDismiss: () -> Unit) {
                     Switch(checked = awake, onCheckedChange = { awake = it })
                 }
                 Text(
-                    "Изменения применяются при следующем создании кода или подключении.",
+                    "Изменения применяются при следующем создании кода или подключении. Версия ${SysActions.versionName(ctx)}.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -168,8 +236,13 @@ fun SettingsDialog(onDismiss: () -> Unit) {
     )
 }
 
-private fun readLog(): String = try {
-    Native.text(Native.log()).lines().filter { it.isNotBlank() }.asReversed().joinToString("\n")
+private fun readDiag(): String = try {
+    val flows = Native.text(Native.flows()).trim()
+    val log = Native.text(Native.log()).lines().filter { it.isNotBlank() }.asReversed().joinToString("\n")
+    "== Потоки через туннель ==\n" +
+        "T: в туннель, R: из туннеля, X: отброшено при отправке, Y: отброшено при получении\n" +
+        (if (flows.isEmpty()) "(пока нет)" else flows) +
+        "\n\n== Журнал (новые сверху) ==\n" + log
 } catch (_: Throwable) {
     ""
 }
@@ -180,7 +253,7 @@ fun LogDialog(onDismiss: () -> Unit) {
     var text by remember { mutableStateOf("") }
     LaunchedEffect(Unit) {
         while (true) {
-            text = withContext(Dispatchers.IO) { readLog() }
+            text = withContext(Dispatchers.IO) { readDiag() }
             delay(1000)
         }
     }
@@ -188,9 +261,9 @@ fun LogDialog(onDismiss: () -> Unit) {
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("Закрыть") } },
         dismissButton = { TextButton(onClick = { SysActions.copy(ctx, text) }) { Text("Копировать") } },
-        title = { Text("Журнал (новые сверху)") },
+        title = { Text("Журнал и потоки") },
         text = {
-            Box(Modifier.heightIn(max = 420.dp)) {
+            Box(Modifier.heightIn(max = 440.dp)) {
                 Column(Modifier.verticalScroll(rememberScrollState())) {
                     SelectionContainer {
                         Text(

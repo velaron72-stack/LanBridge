@@ -25,6 +25,12 @@ data class NetLayout(
     val prefix: Int,
     val bcast: String,
     val initiator: Boolean,
+    /** This device's real addresses that the friend routes to us (the first one becomes the tunnel's primary address). */
+    val realMine: List<String> = emptyList(),
+    /** The friend's real addresses mirrored by the engine. */
+    val realPeer: List<String> = emptyList(),
+    /** The subset of [realPeer] that is safe to route into the tunnel on this device. */
+    val aliasRoutes: List<String> = emptyList(),
 )
 
 data class FriendInfo(
@@ -68,7 +74,6 @@ data class UiState(
     val friendText: String = "",
     val friend: FriendInfo? = null,
     val friendError: String? = null,
-    val password: String = "",
     val layout: NetLayout? = null,
     val stats: Stats? = null,
     val pathText: String = "",
@@ -94,9 +99,6 @@ object TunnelController {
 
     @Volatile
     var layout: NetLayout? = null
-
-    @Volatile
-    var pendingPassword: String = ""
 
     private var lastPhase = Phase.IDLE
     private var connectingSince = 0L
@@ -179,10 +181,6 @@ object TunnelController {
         validateFriend(text)
     }
 
-    fun setPassword(p: String) {
-        _ui.update { it.copy(password = p) }
-    }
-
     fun reportError(msg: String) {
         _ui.update { it.copy(error = msg) }
     }
@@ -192,14 +190,17 @@ object TunnelController {
     }
 
     /** Registers the friend's code in the engine and computes the shared network. Returns an error text or null. */
-    fun prepareConnect(password: String): String? {
+    fun prepareConnect(): String? {
         if (nativeError != null) return "Нативная библиотека не загружена"
         val blob = friendBlob ?: return "Введите код друга"
         val rc = Native.setPeer(blob)
         if (rc != 0) return offerErrorText(rc)
-        val l = parseLayout(Native.kv(Native.layout())) ?: return "Не удалось вычислить адреса сети"
+        val parsed = parseLayout(Native.kv(Native.layout())) ?: return "Не удалось вычислить адреса сети"
+        // Never take over the gateway, a DNS server or an own address of this device with a mirrored route.
+        val keep = NetInfo.sensitiveAddresses(appCtx)
+        val l = parsed.copy(aliasRoutes = parsed.realPeer.filter { it !in keep })
+        Native.note("зеркалируемые адреса друга: ${l.realPeer.joinToString()}; маршруты: ${l.aliasRoutes.joinToString()}; мои: ${l.realMine.joinToString()}")
         layout = l
-        pendingPassword = password
         _ui.update { it.copy(layout = l, error = null, hint = null, testResult = null) }
         return null
     }
@@ -278,7 +279,12 @@ object TunnelController {
         val blob = OfferCodec.extract(text)
         if (blob == null) {
             friendBlob = null
-            _ui.update { it.copy(friend = null, friendError = "В тексте нет кода (он начинается с LB1-)") }
+            val msg = if (OfferCodec.isLegacy(text)) {
+                "Код от версии 1.x. Обновите приложение до 2.0.0 у обоих и создайте коды заново"
+            } else {
+                "В тексте нет кода (он начинается с ${OfferCodec.PREFIX})"
+            }
+            _ui.update { it.copy(friend = null, friendError = msg) }
             return
         }
         val d = Native.kv(Native.describeOffer(blob))
@@ -303,14 +309,16 @@ object TunnelController {
         2 -> "Код повреждён: не сошлась контрольная сумма"
         3 -> "Код друга истёк — пусть создаст новый"
         4 -> "Это ваш собственный код"
-        5 -> "Код создан другой версией приложения"
+        5 -> "Код создан другой версией приложения. Обновите приложение у обоих"
         6 -> "Сначала создайте свой код"
         7 -> "В коде нет адресов"
         8 -> "Ваш код истёк — создайте новый"
         else -> "Ошибка кода ($rc)"
     }
 
-    private fun parseCands(s: String?): List<String> =
+    private fun parseCands(s: String?): List<String> = splitList(s)
+
+    private fun splitList(s: String?): List<String> =
         if (s.isNullOrBlank()) emptyList() else s.split(',').filter { it.isNotBlank() }
 
     private fun parseLayout(m: Map<String, String>): NetLayout? {
@@ -324,6 +332,8 @@ object TunnelController {
             prefix = m["prefix"]?.toIntOrNull() ?: 24,
             bcast = m["bcast"] ?: return null,
             initiator = m["initiator"] == "1",
+            realMine = splitList(m["realMine"]),
+            realPeer = splitList(m["realPeer"]),
         )
     }
 
@@ -331,7 +341,7 @@ object TunnelController {
         if (elapsedMs < 12000L) return null
         return when {
             s.authFail > 0 ->
-                "Пакеты друга приходят, но не проходят проверку: пароль комнаты не совпадает или коды из разных сессий."
+                "Пакеты друга приходят, но не проходят проверку: коды из разных сессий. Создайте новые коды у обоих."
             s.punchRx == 0L && s.hsRx == 0L && (s.myNat == 2 || s.peerNat == 2) ->
                 "Пакеты друга не доходят. Один из NAT симметричный — прямое соединение вряд ли возможно. " +
                     "Вариант: оба в одном Wi-Fi или один раздаёт точку доступа."

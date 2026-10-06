@@ -208,29 +208,6 @@ void deriveSid(uint8_t sid[8], const uint8_t pubA[32], const uint8_t pubB[32]) {
     memcpy(sid, full, 8);
 }
 
-void derivePsk(uint8_t psk[32], const char* password, size_t len, const uint8_t sid[8]) {
-    if (len == 0) {
-        memset(psk, 0, 32);
-        return;
-    }
-    uint8_t h[32];
-    {
-        Blake2s b(32);
-        b.update("LanBridge psk v1", 16);
-        b.update(sid, 8);
-        b.update(password, len);
-        b.final(h);
-    }
-    for (int i = 0; i < 50000; i++) {
-        Blake2s c(32);
-        c.update(h, 32);
-        c.update(password, len);
-        c.final(h);
-    }
-    memcpy(psk, h, 32);
-    crypto::wipe(h, sizeof h);
-}
-
 bool ReplayWindow::check(uint64_t c) const {
     if (!any) return true;
     if (c > top) return true;

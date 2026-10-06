@@ -81,19 +81,21 @@ JNIEXPORT jbyteArray JNICALL Java_app_lanbridge_core_Native_layout(JNIEnv* env, 
     try {
         lb::Layout l;
         if (!engine().layout(l)) return nullptr;
-        std::string t = lb::strfmt("my=%s\npeer=%s\nnet=%s\nprefix=%d\nbcast=%s\ninitiator=%d\n", lb::ipStr(l.myIp).c_str(),
-                                   lb::ipStr(l.peerIp).c_str(), lb::ipStr(l.net).c_str(), l.prefix,
-                                   lb::ipStr(l.bcast).c_str(), l.initiator ? 1 : 0);
+        std::string mine, peer;
+        for (uint32_t x : l.aliasMine) mine += (mine.empty() ? "" : ",") + lb::ipStr(x);
+        for (uint32_t x : l.aliasPeer) peer += (peer.empty() ? "" : ",") + lb::ipStr(x);
+        std::string t = lb::strfmt("my=%s\npeer=%s\nnet=%s\nprefix=%d\nbcast=%s\ninitiator=%d\nrealMine=%s\nrealPeer=%s\n",
+                                   lb::ipStr(l.myIp).c_str(), lb::ipStr(l.peerIp).c_str(), lb::ipStr(l.net).c_str(), l.prefix,
+                                   lb::ipStr(l.bcast).c_str(), l.initiator ? 1 : 0, mine.c_str(), peer.c_str());
         return fromStr(env, t);
     } catch (...) {
         return nullptr;
     }
 }
 
-JNIEXPORT jint JNICALL Java_app_lanbridge_core_Native_start(JNIEnv* env, jobject, jint tunFd, jbyteArray password,
-                                                           jint mtu) {
+JNIEXPORT jint JNICALL Java_app_lanbridge_core_Native_start(JNIEnv*, jobject, jint tunFd, jint mtu) {
     try {
-        return (jint)engine().start((int)tunFd, toStr(env, password), (int)mtu);
+        return (jint)engine().start((int)tunFd, (int)mtu);
     } catch (...) {
         return -1;
     }
@@ -130,6 +132,14 @@ JNIEXPORT jlongArray JNICALL Java_app_lanbridge_core_Native_status(JNIEnv* env, 
 JNIEXPORT jbyteArray JNICALL Java_app_lanbridge_core_Native_info(JNIEnv* env, jobject) {
     try {
         return fromStr(env, engine().info());
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+JNIEXPORT jbyteArray JNICALL Java_app_lanbridge_core_Native_flows(JNIEnv* env, jobject) {
+    try {
+        return fromStr(env, engine().flows());
     } catch (...) {
         return nullptr;
     }

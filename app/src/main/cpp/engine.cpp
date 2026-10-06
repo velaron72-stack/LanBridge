@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <deque>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -94,7 +95,7 @@ struct Engine::Impl {
     Layout lay;
     bool initiator = false;
     uint8_t sid[8];
-    uint8_t psk[32];
+    uint8_t psk[32];  // always zero: peers authenticate each other with the keys from the exchanged codes
 
     // runtime
     int tunFd = -1;
@@ -120,6 +121,27 @@ struct Engine::Impl {
     uint64_t bcastTx = 0, bcastRx = 0, mcastTx = 0, mcastRx = 0;
     uint64_t authFail = 0, punchRx = 0, hsRx = 0, dropped = 0, handshakes = 0;
     int64_t rttMs = -1;
+
+    // diagnostics
+    uint64_t dropForeignDst = 0, dropNoSession = 0, dropBadHdr = 0, dropRxSrc = 0, dropRxDst = 0, tunWriteErr = 0;
+    uint64_t udpQueued = 0, udpDropped = 0;
+    struct Flow {
+        char dir;  // T forwarded to the peer, R delivered to the TUN, X dropped (TUN side), Y dropped (peer side)
+        uint8_t proto;
+        uint32_t sip, dip;
+        uint16_t sport, dport;
+        uint64_t pkts, bytes;
+    };
+    std::vector<Flow> flowTab;
+    uint64_t flowOverflow = 0;
+
+    // outgoing datagrams that did not fit into the socket buffer yet
+    struct OutPkt {
+        sockaddr_in to;
+        uint16_t len;
+        uint8_t data[2048];
+    };
+    std::deque<OutPkt> outq;
 
     Impl() {
         memset(&kp, 0, sizeof kp);
@@ -160,7 +182,7 @@ struct Engine::Impl {
         int fl = fcntl(s, F_GETFL, 0);
         fcntl(s, F_SETFL, fl | O_NONBLOCK);
         fcntl(s, F_SETFD, FD_CLOEXEC);
-        int buf = 1 << 20;
+        int buf = 4 << 20;
         setsockopt(s, SOL_SOCKET, SO_RCVBUF, &buf, sizeof buf);
         setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof buf);
         sockaddr_in a = mkAddr(0, 0);
@@ -207,11 +229,14 @@ struct Engine::Impl {
         rxBytes = txBytes = rxPkts = txPkts = 0;
         bcastTx = bcastRx = mcastTx = mcastRx = 0;
         authFail = punchRx = hsRx = dropped = handshakes = 0;
+        dropForeignDst = dropNoSession = dropBadHdr = dropRxSrc = dropRxDst = tunWriteErr = 0;
+        udpQueued = udpDropped = flowOverflow = 0;
+        flowTab.clear();
+        outq.clear();
         rttMs = -1;
         lastRxMs = lastTxMs = 0;
         connectStartMs = connectedSinceMs = 0;
         nextProbeMs = nextPingMs = nextRekeyMs = 0;
-        crypto::wipe(psk, sizeof psk);
         closeTunLocked();
     }
 
@@ -286,8 +311,31 @@ struct Engine::Impl {
 
     // ------------------------------------------------------------ sending
     void sendRaw(const sockaddr_in& to, const uint8_t* b, size_t n) {
-        if (sock < 0) return;
-        sendto(sock, b, n, MSG_DONTWAIT, (const sockaddr*)&to, sizeof to);
+        if (sock < 0 || n > sizeof(OutPkt::data)) return;
+        if (outq.empty()) {
+            ssize_t r = sendto(sock, b, n, MSG_DONTWAIT, (const sockaddr*)&to, sizeof to);
+            if (r >= 0) return;
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOBUFS) return;
+        }
+        if (outq.size() >= 2048) {
+            udpDropped++;
+            return;
+        }
+        OutPkt p;
+        p.to = to;
+        p.len = (uint16_t)n;
+        memcpy(p.data, b, n);
+        outq.push_back(p);
+        udpQueued++;
+    }
+
+    void flushOut() {
+        while (!outq.empty()) {
+            const OutPkt& p = outq.front();
+            ssize_t r = sendto(sock, p.data, p.len, MSG_DONTWAIT, (const sockaddr*)&p.to, sizeof p.to);
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) break;
+            outq.pop_front();
+        }
     }
 
     void sendToCands(const uint8_t* b, size_t n, const sockaddr_in* skip) {
@@ -415,8 +463,10 @@ struct Engine::Impl {
         while (running.load()) {
             int timeout;
             int tfd;
+            bool wantOut = false;
             {
                 std::lock_guard<std::mutex> g(mu);
+                wantOut = !outq.empty();
                 int64_t t = (int64_t)nextTickMs - (int64_t)nowMs();
                 if (t < 0) t = 0;
                 if (t > 1000) t = 1000;
@@ -425,7 +475,7 @@ struct Engine::Impl {
             }
             pollfd fds[3];
             int nf = 0, ti = -1;
-            fds[nf++] = pollfd{sock, POLLIN, 0};
+            fds[nf++] = pollfd{sock, (short)(POLLIN | (wantOut ? POLLOUT : 0)), 0};
             fds[nf++] = pollfd{wakeFd[0], POLLIN, 0};
             if (tfd >= 0) {
                 ti = nf;
@@ -438,9 +488,11 @@ struct Engine::Impl {
             uint64_t now = nowMs();
             if (r > 0) {
                 if (fds[1].revents & POLLIN) drainWake();
+                if (fds[0].revents & POLLOUT) flushOut();
                 if (fds[0].revents & POLLIN) readUdp(now);
                 if (ti >= 0 && tunFd == tfd && fds[ti].revents) readTun(now, fds[ti].revents);
             }
+            if (!outq.empty()) flushOut();
             tick(now);
         }
     }
@@ -491,7 +543,7 @@ struct Engine::Impl {
     // ------------------------------------------------------------ receiving: UDP
     void readUdp(uint64_t now) {
         uint8_t buf[2600];
-        for (int i = 0; i < 64; i++) {
+        for (int i = 0; i < 256; i++) {
             sockaddr_in from;
             socklen_t fl = sizeof from;
             ssize_t n = recvfrom(sock, buf, sizeof buf, MSG_DONTWAIT, (sockaddr*)&from, &fl);
@@ -696,36 +748,81 @@ struct Engine::Impl {
     }
 
     // ------------------------------------------------------------ TUN side
+    static bool inVec(const std::vector<uint32_t>& v, uint32_t x) {
+        for (uint32_t y : v)
+            if (y == x) return true;
+        return false;
+    }
+    bool isPeerAddr(uint32_t ip) const { return ip == lay.peerIp || inVec(lay.aliasPeer, ip); }
+    bool isMyAddr(uint32_t ip) const { return ip == lay.myIp || inVec(lay.aliasMine, ip); }
+
+    void noteFlow(char dir, const uint8_t* ip, size_t tot) {
+        if (tot < 20) return;
+        size_t ihl = (size_t)(ip[0] & 15) * 4;
+        uint8_t proto = ip[9];
+        uint16_t sp = 0, dp = 0;
+        bool first = (be16(ip + 6) & 0x1FFF) == 0;
+        if (first && (proto == 6 || proto == 17) && tot >= ihl + 4) {
+            sp = be16(ip + ihl);
+            dp = be16(ip + ihl + 2);
+        } else if (first && proto == 1 && tot >= ihl + 2) {
+            sp = ip[ihl];
+            dp = ip[ihl + 1];
+        }
+        uint32_t s = be32(ip + 12), d = be32(ip + 16);
+        for (Flow& f : flowTab) {
+            if (f.dir == dir && f.proto == proto && f.sip == s && f.dip == d && f.sport == sp && f.dport == dp) {
+                f.pkts++;
+                f.bytes += tot;
+                return;
+            }
+        }
+        if (flowTab.size() >= 64) {
+            flowOverflow++;
+            return;
+        }
+        flowTab.push_back(Flow{dir, proto, s, d, sp, dp, 1, (uint64_t)tot});
+    }
+
     void deliverIp(const uint8_t* ip, size_t len) {
         if (tunFd < 0) return;
         if (len < 20 || (ip[0] >> 4) != 4) {
             dropped++;
+            dropBadHdr++;
             return;
         }
         size_t ihl = (size_t)(ip[0] & 15) * 4;
         size_t tot = be16(ip + 2);
         if (ihl < 20 || ihl > len || tot < ihl || tot > len) {
             dropped++;
+            dropBadHdr++;
             return;
         }
         uint32_t src = be32(ip + 12), dst = be32(ip + 16);
-        if (src != lay.peerIp) {
+        if (!isPeerAddr(src)) {
             dropped++;
+            dropRxSrc++;
+            noteFlow('Y', ip, tot);
             return;
         }
         bool bc = dst == 0xFFFFFFFFu || dst == lay.bcast;
         bool mc = (dst >> 28) == 0xE;
-        if (!(dst == lay.myIp || bc || mc)) {
+        if (!(isMyAddr(dst) || bc || mc)) {
             dropped++;
+            dropRxDst++;
+            noteFlow('Y', ip, tot);
             return;
         }
         ssize_t w = write(tunFd, ip, tot);
         if (w < 0) {
             dropped++;
-            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR && errno != EINVAL && errno != EMSGSIZE)
+            tunWriteErr++;
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR && errno != EINVAL && errno != EMSGSIZE &&
+                errno != ENOBUFS)
                 failTunLocked(strfmt("TUN write: %s", strerror(errno)));
             return;
         }
+        noteFlow('R', ip, tot);
         rxPkts++;
         rxBytes += tot;
         if (bc) bcastRx++;
@@ -734,7 +831,7 @@ struct Engine::Impl {
 
     void readTun(uint64_t now, short revents) {
         uint8_t buf[4096];
-        for (int i = 0; i < 64; i++) {
+        for (int i = 0; i < 256; i++) {
             ssize_t n = read(tunFd, buf, sizeof buf);
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) break;
@@ -755,27 +852,36 @@ struct Engine::Impl {
         if (n < 20 || (p[0] >> 4) != 4) return;  // IPv6 etc. is not routed into the tunnel
         size_t ihl = (size_t)(p[0] & 15) * 4;
         size_t tot = be16(p + 2);
-        if (ihl < 20 || ihl > n || tot < ihl || tot > n) return;
+        if (ihl < 20 || ihl > n || tot < ihl || tot > n) {
+            dropBadHdr++;
+            return;
+        }
         if (p[9] == 2) return;  // IGMP stays local
         uint32_t dst = be32(p + 16);
         enum { UC, BC, MC } kind;
-        if (dst == lay.peerIp) kind = UC;
+        if (isPeerAddr(dst)) kind = UC;
         else if (dst == 0xFFFFFFFFu || dst == lay.bcast) kind = BC;
         else if ((dst >> 28) == 0xE) kind = MC;
         else {
             dropped++;
+            dropForeignDst++;
+            noteFlow('X', p, tot);
             return;
         }
         Session* cur = bestSession(now);
         if (!cur) {
             dropped++;
+            dropNoSession++;
             return;
         }
-        if (be32(p + 12) != lay.myIp) ipRewriteSrc(p, tot, lay.myIp);
+        // Packets keep their source when it is our virtual or a mirrored real address (replies then match what the
+        // application expects); anything else is rewritten to the virtual address.
+        if (!isMyAddr(be32(p + 12))) ipRewriteSrc(p, tot, lay.myIp);
         uint8_t plain[MAX_PLAIN];
         if (tot + 1 > sizeof plain) return;
         plain[0] = K_IP;
         memcpy(plain + 1, p, tot);
+        noteFlow('T', p, tot);
         sendTransport(cur, plain, tot + 1, now);
         txPkts++;
         txBytes += tot;
@@ -843,7 +949,7 @@ int Engine::prepare(const std::vector<std::string>& stunServers, const std::vect
     LBLOG("тип NAT: %s", nat == 1 ? "конусный (EIM)" : nat == 2 ? "симметричный (EDM)" : "не определён");
 
     Offer o;
-    o.version = 1;
+    o.version = kOfferVersion;
     o.expiresAt = (uint32_t)(wallMs() / 1000 + (uint64_t)(ttlSec > 0 ? ttlSec : 600));
     o.nat = (uint8_t)nat;
     o.name = sanitize(deviceName, 24);
@@ -929,7 +1035,7 @@ bool Engine::layout(Layout& out) {
     return true;
 }
 
-int Engine::start(int tunFd, const std::string& password, int mtu) {
+int Engine::start(int tunFd, int mtu) {
     Impl& s = *p_;
     std::lock_guard<std::mutex> g(s.mu);
     auto fail = [&](int code, const char* msg) {
@@ -960,7 +1066,11 @@ int Engine::start(int tunFd, const std::string& password, int mtu) {
     s.connectedSinceMs = 0;
     s.nextPingMs = s.nextRekeyMs = s.nextProbeMs = 0;
 
-    derivePsk(s.psk, password.data(), password.size(), s.sid);
+    memset(s.psk, 0, sizeof s.psk);
+    s.dropForeignDst = s.dropNoSession = s.dropBadHdr = s.dropRxSrc = s.dropRxDst = s.tunWriteErr = 0;
+    s.udpQueued = s.udpDropped = s.flowOverflow = 0;
+    s.flowTab.clear();
+    s.outq.clear();
     s.tunFd = tunFd;
     s.mtu = mtu;
     s.connectStartMs = nowMs();
@@ -968,7 +1078,7 @@ int Engine::start(int tunFd, const std::string& password, int mtu) {
     s.setState(ST_CONNECTING);
     s.startThreadLocked();
     s.wake();
-    LBLOG("старт: TUN fd=%d, MTU %d, пароль %s", tunFd, mtu, password.empty() ? "нет" : "да");
+    LBLOG("старт: TUN fd=%d, MTU %d", tunFd, mtu);
     return 0;
 }
 
@@ -1057,6 +1167,10 @@ std::string Engine::info() {
         o += strfmt("myIp=%s\npeerIp=%s\nnet=%s\nprefix=%d\nrole=%s\npeerName=%s\n", ipStr(s.lay.myIp).c_str(),
                     ipStr(s.lay.peerIp).c_str(), ipStr(s.lay.net).c_str(), s.lay.prefix,
                     s.initiator ? "initiator" : "responder", s.peer.name.c_str());
+        std::string ra, ap;
+        for (uint32_t x : s.lay.aliasMine) ra += (ra.empty() ? "" : ",") + ipStr(x);
+        for (uint32_t x : s.lay.aliasPeer) ap += (ap.empty() ? "" : ",") + ipStr(x);
+        o += "realIp=" + ra + "\naliasPeer=" + ap + "\n";
     }
     o += strfmt("localPort=%u\nstun=%d\nmtu=%d\n", (unsigned)s.localPort, (int)s.stun.size(), s.mtu);
     std::string m;
@@ -1065,6 +1179,36 @@ std::string Engine::info() {
         m += strfmt("%s:%u", ipStr(sv.mapped.ip).c_str(), (unsigned)sv.mapped.port);
     }
     o += "mapped=" + m + "\n";
+    return o;
+}
+
+std::string Engine::flows() {
+    Impl& s = *p_;
+    std::lock_guard<std::mutex> g(s.mu);
+    std::string o = strfmt(
+        "drops foreignDst=%llu noSession=%llu badHeader=%llu rxSrc=%llu rxDst=%llu tunWrite=%llu udpQueued=%llu "
+        "udpDropped=%llu flowOverflow=%llu\n",
+        (unsigned long long)s.dropForeignDst, (unsigned long long)s.dropNoSession, (unsigned long long)s.dropBadHdr,
+        (unsigned long long)s.dropRxSrc, (unsigned long long)s.dropRxDst, (unsigned long long)s.tunWriteErr,
+        (unsigned long long)s.udpQueued, (unsigned long long)s.udpDropped, (unsigned long long)s.flowOverflow);
+    std::vector<Impl::Flow> v = s.flowTab;
+    std::sort(v.begin(), v.end(), [](const Impl::Flow& a, const Impl::Flow& b) { return a.bytes > b.bytes; });
+    for (size_t i = 0; i < v.size() && i < 30; i++) {
+        const Impl::Flow& f = v[i];
+        const char* pn = f.proto == 6 ? "TCP" : f.proto == 17 ? "UDP" : f.proto == 1 ? "ICMP" : f.proto == 2 ? "IGMP" : "IP";
+        std::string a = ipStr(f.sip), b = ipStr(f.dip);
+        if (f.proto == 6 || f.proto == 17) {
+            if (f.sport == 0 && f.dport == 0) {
+                a += ":frag";
+                b += ":frag";
+            } else {
+                a += ":" + std::to_string(f.sport);
+                b += ":" + std::to_string(f.dport);
+            }
+        }
+        o += strfmt("%c %s %s > %s pkts=%llu bytes=%llu\n", f.dir, pn, a.c_str(), b.c_str(), (unsigned long long)f.pkts,
+                    (unsigned long long)f.bytes);
+    }
     return o;
 }
 

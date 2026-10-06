@@ -8,6 +8,8 @@
 
 namespace lb {
 
+constexpr uint8_t kOfferVersion = 2;  // 2: adds mirrored real addresses; 1.x codes are rejected
+
 struct Candidate {
     uint8_t type;   // 0 = host (local interface address), 1 = server reflexive (public address from STUN)
     uint32_t ip;    // host byte order
@@ -15,7 +17,7 @@ struct Candidate {
 };
 
 struct Offer {
-    uint8_t version = 1;
+    uint8_t version = 2;
     uint32_t expiresAt = 0;  // unix seconds
     uint8_t pub[32] = {0};   // one-time static public key (X25519)
     uint8_t nat = 0;         // 0 unknown, 1 endpoint-independent mapping, 2 endpoint-dependent (symmetric)
@@ -43,6 +45,10 @@ struct Layout {
     uint32_t net = 0, myIp = 0, peerIp = 0, bcast = 0;
     int prefix = 24;
     bool initiator = false;  // the peer with the lower public key initiates handshakes and gets .1
+    // Real (interface) addresses mirrored through the tunnel, so that apps which bind to, or advertise, the real
+    // address of a device still work. Both sides derive the same lists from the two offers.
+    std::vector<uint32_t> aliasPeer;  // peer's real addresses: routed into the TUN, forwarded to the peer unchanged
+    std::vector<uint32_t> aliasMine;  // our real addresses that the peer routes to us: kept as packet source
 };
 Layout computeLayout(const Offer& mine, const Offer& peer);
 

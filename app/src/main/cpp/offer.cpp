@@ -14,7 +14,7 @@ bool offerEncode(const Offer& o, std::vector<uint8_t>& out) {
     out.clear();
     if (o.cands.empty() || o.cands.size() > kMaxCands) return false;
     std::string name = o.name.substr(0, kMaxName);
-    out.push_back(1);  // version
+    out.push_back(kOfferVersion);
     out.push_back(0);  // flags
     uint8_t b4[4];
     putBe32(b4, o.expiresAt);
@@ -40,7 +40,7 @@ bool offerEncode(const Offer& o, std::vector<uint8_t>& out) {
 
 int offerDecode(const uint8_t* p, size_t n, Offer& o) {
     if (n < 8) return OFFER_FORMAT;
-    if (p[0] != 1) return OFFER_VERSION;
+    if (p[0] != kOfferVersion) return OFFER_VERSION;
     size_t pos = 2;
     if (n < 6 + 32 + 2 + 1 + 4) return OFFER_FORMAT;
     Offer r;
@@ -105,6 +105,36 @@ Layout computeLayout(const Offer& mine, const Offer& peer) {
     l.initiator = memcmp(mine.pub, peer.pub, 32) < 0;
     l.myIp = chosen | (l.initiator ? 1u : 2u);
     l.peerIp = chosen | (l.initiator ? 2u : 1u);
+
+    // A real address is mirrored through the tunnel unless it could be confused with something on the side that
+    // installs the route: it must differ from every host address of that side, and inside a network shared with that
+    // side it must not look like a gateway or a broadcast address (.0, .1, .254, .255). The Android side additionally
+    // drops addresses that are its actual gateway or DNS server.
+    auto aliasOk = [&](uint32_t ip, const Offer& installer) {
+        uint32_t a = ip >> 24;
+        if (a == 0 || a == 127 || a >= 224) return false;
+        if ((ip >> 16) == ((169u << 8) | 254u)) return false;
+        if ((ip & 0xFFFFFF00u) == l.net) return false;
+        uint32_t last = ip & 0xFFu;
+        if (last == 0 || last == 255) return false;
+        for (const Candidate& c : installer.cands) {
+            if (c.type != 0) continue;
+            if (c.ip == ip) return false;
+            if ((c.ip >> 8) == (ip >> 8) && (last == 1 || last == 254)) return false;
+        }
+        return true;
+    };
+    auto collect = [&](const Offer& from, const Offer& installer, std::vector<uint32_t>& out) {
+        for (const Candidate& c : from.cands) {
+            if (c.type != 0 || out.size() >= 4) continue;
+            if (!aliasOk(c.ip, installer)) continue;
+            bool dup = false;
+            for (uint32_t x : out) dup |= x == c.ip;
+            if (!dup) out.push_back(c.ip);
+        }
+    };
+    collect(peer, mine, l.aliasPeer);
+    collect(mine, peer, l.aliasMine);
     return l;
 }
 

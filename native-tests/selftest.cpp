@@ -190,12 +190,10 @@ static void testProtocol() {
     uint8_t sid2[8];
     deriveSid(sid2, kr.pub, ki.pub);
     CHECK(memcmp(sid, sid2, 8) == 0);
-    uint8_t psk[32], psk2[32], psk0[32];
-    derivePsk(psk, "secret", 6, sid);
-    derivePsk(psk2, "Secret", 6, sid);
-    derivePsk(psk0, "", 0, sid);
+    uint8_t psk[32], psk2[32];  // the handshake supports a PSK (the app itself uses an all-zero one)
+    randomBytes(psk, 32);
+    randomBytes(psk2, 32);
     CHECK(memcmp(psk, psk2, 32) != 0);
-    CHECK(H(psk0, 32) == std::string(64, '0'));
 
     for (int variant = 0; variant < 4; variant++) {
         HsInit hi;
@@ -310,6 +308,27 @@ static void testProtocol() {
     CHECK(la.net == lb2.net && la.myIp == lb2.peerIp && la.peerIp == lb2.myIp && la.initiator != lb2.initiator);
     CHECK(la.net == ((192u << 24) | (168u << 16) | (177u << 8)));  // moved to the next free network
     CHECK(la.bcast == (la.net | 255u));
+    CHECK((la.aliasPeer == std::vector<uint32_t>{(192u << 24) | (168u << 16) | (77u << 8) | 31u}));  // same /24, other hosts
+    CHECK((la.aliasMine == std::vector<uint32_t>{(192u << 24) | (168u << 16) | (77u << 8) | 20u}));
+
+    {
+        Offer x, y;
+        memcpy(x.pub, a.pub, 32);
+        memcpy(y.pub, b.pub, 32);
+        auto ip4 = [](uint32_t a_, uint32_t b_, uint32_t c_, uint32_t d_) { return (a_ << 24) | (b_ << 16) | (c_ << 8) | d_; };
+        x.cands.push_back(Candidate{0, ip4(192, 168, 1, 5), 4000});
+        x.cands.push_back(Candidate{0, ip4(10, 1, 2, 1), 4000});    // looks like a gateway inside y's 10.1.2.0/24
+        x.cands.push_back(Candidate{0, ip4(10, 1, 2, 3), 4000});    // same network as y, different host: fine
+        x.cands.push_back(Candidate{0, 0x7F000001u, 4000});
+        x.cands.push_back(Candidate{1, ip4(203, 0, 113, 9), 4000});
+        y.cands.push_back(Candidate{0, ip4(10, 20, 30, 7), 4001});
+        y.cands.push_back(Candidate{0, ip4(10, 1, 2, 99), 4001});
+        y.cands.push_back(Candidate{0, ip4(192, 168, 1, 5), 4001});  // the very same address as x's: cannot be mirrored
+        Layout lx = computeLayout(x, y), ly = computeLayout(y, x);
+        CHECK((lx.aliasPeer == std::vector<uint32_t>{ip4(10, 20, 30, 7), ip4(10, 1, 2, 99)}));
+        CHECK((lx.aliasMine == std::vector<uint32_t>{ip4(10, 1, 2, 3)}));
+        CHECK(lx.aliasPeer == ly.aliasMine && lx.aliasMine == ly.aliasPeer);  // both sides agree
+    }
 
     // source rewrite keeps both checksums valid
     std::vector<uint8_t> p = mkUdp((192u << 24) | (168u << 16) | (1u << 8) | 5u, 0xFFFFFFFFu, 4000, 47777, "hello broadcast!");
@@ -506,12 +525,15 @@ static Config fastCfg() {
     return c;
 }
 
-static bool setupPair(Node& A, Node& B, const Config& cfg, const char* pwA, const char* pwB, int delayB) {
+static bool setupPair(Node& A, Node& B, const Config& cfg, int delayB, const char* ipA = "127.0.0.1", const char* ipB = "127.0.0.1") {
     A.e.setConfig(cfg);
     B.e.setConfig(cfg);
     bool ok = true;
-    ok &= A.e.prepare({}, {"127.0.0.1"}, "Alpha", 600, A.offer) == 0;
-    ok &= B.e.prepare({}, {"127.0.0.1"}, "Bravo", 600, B.offer) == 0;
+    std::vector<std::string> la_{ipA}, lb_{ipB};
+    if (strcmp(ipA, "127.0.0.1")) la_.push_back("127.0.0.1");
+    if (strcmp(ipB, "127.0.0.1")) lb_.push_back("127.0.0.1");
+    ok &= A.e.prepare({}, la_, "Alpha", 600, A.offer) == 0;
+    ok &= B.e.prepare({}, lb_, "Bravo", 600, B.offer) == 0;
     ok &= A.e.setPeer(B.offer) == OFFER_OK;
     ok &= B.e.setPeer(A.offer) == OFFER_OK;
     Layout la, lb2;
@@ -519,9 +541,9 @@ static bool setupPair(Node& A, Node& B, const Config& cfg, const char* pwA, cons
     ok &= la.net == lb2.net && la.myIp == lb2.peerIp && la.peerIp == lb2.myIp && la.initiator != lb2.initiator;
     A.tun = mkTun();
     B.tun = mkTun();
-    ok &= A.e.start(A.tun.engineFd, pwA, 1280) == 0;
+    ok &= A.e.start(A.tun.engineFd, 1280) == 0;
     if (delayB) sleepMs(delayB);
-    ok &= B.e.start(B.tun.engineFd, pwB, 1280) == 0;
+    ok &= B.e.start(B.tun.engineFd, 1280) == 0;
     return ok;
 }
 
@@ -531,7 +553,7 @@ static void testEngine(int round) {
     printf("[engine] round %d\n", round);
     Node A, B;
     Config cfg = fastCfg();
-    CHECK(setupPair(A, B, cfg, "room-pass", "room-pass", round % 2 ? 700 : 0));
+    CHECK(setupPair(A, B, cfg, round % 2 ? 700 : 0));
     CHECK(waitFor([&] { return A.state() == ST_CONNECTED && B.state() == ST_CONNECTED; }, 8000));
     Layout la, lb2;
     A.e.layout(la);
@@ -623,16 +645,29 @@ static void testEngine(int round) {
     CHECK(A.state() == ST_IDLE);
 }
 
-static void testWrongPassword() {
-    printf("[engine] wrong password\n");
-    Node A, B;
+static void testStranger() {
+    printf("[engine] stranger is rejected\n");
+    // A and B pair up with each other; C (a third device) only knows A's code and tries to connect to it.
+    Node A, B, C;
     Config cfg = fastCfg();
-    CHECK(setupPair(A, B, cfg, "one", "two", 0));
+    CHECK(setupPair(A, B, cfg, 0));
+    C.e.setConfig(cfg);
+    CHECK(C.e.prepare({}, {"127.0.0.1"}, "Charlie", 600, C.offer) == 0);
+    CHECK(C.e.setPeer(A.offer) == OFFER_OK);
+    C.tun = mkTun();
+    CHECK(C.e.start(C.tun.engineFd, 1280) == 0);
+    CHECK(waitFor([&] { return A.state() == ST_CONNECTED && B.state() == ST_CONNECTED; }, 8000));
     sleepMs(2500);
-    CHECK(A.state() != ST_CONNECTED && B.state() != ST_CONNECTED);
-    CHECK(A.field(13) + B.field(13) > 0);  // somebody saw packets that failed authentication
+    CHECK(C.state() != ST_CONNECTED);
+    CHECK(A.state() == ST_CONNECTED);  // the real friend is not disturbed
+    Layout lc, lA;
+    C.e.layout(lc);
+    A.e.layout(lA);
+    // Only a responder inspects incoming handshakes: if C initiates and A answers, A must have rejected C.
+    if (lc.initiator && !lA.initiator) CHECK(A.field(13) > 0);
     A.e.stop();
     B.e.stop();
+    C.e.stop();
 }
 
 static void testConnectTimeout() {
@@ -646,12 +681,12 @@ static void testConnectTimeout() {
     CHECK(B.e.prepare({}, {"127.0.0.1"}, "B", 600, B.offer) == 0);
     CHECK(A.e.setPeer(B.offer) == OFFER_OK);
     A.tun = mkTun();
-    CHECK(A.e.start(A.tun.engineFd, "", 1280) == 0);  // B never starts
+    CHECK(A.e.start(A.tun.engineFd, 1280) == 0);  // B never starts
     CHECK(waitFor([&] { return A.state() == ST_FAILED; }, 4000));
     CHECK(!A.e.lastError().empty());
     CHECK(B.e.setPeer(A.offer) == OFFER_OK);
     B.tun = mkTun();
-    CHECK(B.e.start(B.tun.engineFd, "", 1280) == 0);
+    CHECK(B.e.start(B.tun.engineFd, 1280) == 0);
     A.e.retry();  // second attempt, B is now listening
     CHECK(waitFor([&] { return A.state() == ST_CONNECTED && B.state() == ST_CONNECTED; }, 5000));
     A.e.stop();
@@ -665,7 +700,7 @@ static void testRekey() {
     cfg.rekeyAfterMs = 1200;
     cfg.rejectAfterMs = 5000;
     cfg.hsRefreshMs = 300;
-    CHECK(setupPair(A, B, cfg, "", "", 0));
+    CHECK(setupPair(A, B, cfg, 0));
     CHECK(waitFor([&] { return A.state() == ST_CONNECTED && B.state() == ST_CONNECTED; }, 8000));
     Layout la, lb2;
     A.e.layout(la);
@@ -696,6 +731,49 @@ static void testRekey() {
     B.e.stop();
 }
 
+static void testAliasEngine() {
+    printf("[engine] mirrored real addresses\n");
+    Node A, B;
+    Config cfg = fastCfg();
+    const uint32_t ra = (192u << 24) | (168u << 16) | (1u << 8) | 5u, rb = (10u << 24) | (20u << 16) | (30u << 8) | 7u;
+    CHECK(setupPair(A, B, cfg, 0, "192.168.1.5", "10.20.30.7"));
+    CHECK(waitFor([&] { return A.state() == ST_CONNECTED && B.state() == ST_CONNECTED; }, 8000));
+    Layout la, lb2;
+    A.e.layout(la);
+    B.e.layout(lb2);
+    CHECK(la.aliasPeer == std::vector<uint32_t>{rb} && la.aliasMine == std::vector<uint32_t>{ra});
+    std::string ia = A.e.info();
+    CHECK(ia.find("realIp=192.168.1.5") != std::string::npos && ia.find("aliasPeer=10.20.30.7") != std::string::npos);
+    std::vector<uint8_t> got;
+
+    auto r1 = mkUdp(ra, rb, 5000, 6000, "real to real");  // source and destination are both real addresses
+    sendTun(A, r1);
+    CHECK(readPkt(B.tun.testFd, got, 2000) && got == r1);  // delivered unchanged
+    auto r2 = mkUdp(rb, ra, 6000, 5000, "reply from the real address");
+    sendTun(B, r2);
+    CHECK(readPkt(A.tun.testFd, got, 2000) && got == r2);
+    auto r3 = mkUdp(ra, lb2.myIp, 1, 2, "real source to the virtual address");  // bound to the real address
+    sendTun(A, r3);
+    CHECK(readPkt(B.tun.testFd, got, 2000) && got == r3);  // the source is kept so that the reply finds the socket
+    auto r4 = mkUdp(la.myIp, rb, 3, 4, "virtual source to the real address");
+    sendTun(A, r4);
+    CHECK(readPkt(B.tun.testFd, got, 2000) && got == r4);
+    auto bc = mkUdp(ra, 0xFFFFFFFFu, 4000, 47777, "broadcast from the real address");
+    sendTun(A, bc);
+    CHECK(readPkt(B.tun.testFd, got, 2000) && got == bc);
+
+    sendTun(A, mkUdp(ra, rb + 1, 1, 2, "not mirrored"));   // another address of the peer's network: not ours to carry
+    CHECK(!readPkt(B.tun.testFd, got, 300));
+    sendTun(A, mkUdp(0x01020304u, rb, 1, 2, "odd source")); // rewritten to the virtual address
+    CHECK(readPkt(B.tun.testFd, got, 2000) && be32(&got[12]) == la.myIp && checksumsOk(got));
+
+    std::string fl = A.e.flows();
+    CHECK(fl.find("T UDP 192.168.1.5:5000 > 10.20.30.7:6000") != std::string::npos);
+    CHECK(fl.find("foreignDst=1") != std::string::npos);
+    A.e.stop();
+    B.e.stop();
+}
+
 static void testApiMisuse() {
     printf("[engine] api misuse\n");
     Engine e;
@@ -703,12 +781,12 @@ static void testApiMisuse() {
     std::string text;
     CHECK(e.describe(blob, text) != OFFER_OK);
     CHECK(e.setPeer(blob) != OFFER_OK);
-    CHECK(e.start(-1, "", 1280) != 0);
+    CHECK(e.start(-1, 1280) != 0);
     Layout l;
     CHECK(!e.layout(l));
     CHECK(e.prepare({}, {"127.0.0.1"}, "me", 600, offer) == 0);
     CHECK(e.setPeer(offer) == OFFER_OWN);                 // own code
-    CHECK(e.start(-1, "", 1280) != 0);                    // no peer
+    CHECK(e.start(-1, 1280) != 0);                    // no peer
     // expired code
     Engine f;
     std::vector<uint8_t> o2;
@@ -731,7 +809,8 @@ int main() {
     testStun();
     testApiMisuse();
     for (int i = 0; i < 4; i++) testEngine(i);
-    testWrongPassword();
+    testStranger();
+    testAliasEngine();
     testConnectTimeout();
     testRekey();
     printf("\nresult: %d checks passed, %d failed\n", g_pass, g_fail);

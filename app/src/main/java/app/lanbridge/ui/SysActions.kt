@@ -10,6 +10,13 @@ import android.os.PowerManager
 import android.provider.Settings
 
 object SysActions {
+    @Suppress("DEPRECATION")
+    fun versionName(ctx: Context): String = try {
+        ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: ""
+    } catch (_: Exception) {
+        ""
+    }
+
     fun copy(ctx: Context, text: String) {
         try {
             val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager

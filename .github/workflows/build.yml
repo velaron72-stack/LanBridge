@@ -68,3 +68,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run native self-test
         run: bash native-tests/run.sh
+      - name: Run real-kernel traffic test (TUN devices in network namespaces)
+        run: sudo env "PATH=$PATH" python3 native-tests/nettest.py all

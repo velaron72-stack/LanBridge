@@ -60,7 +60,6 @@ bool hsConsumeInitiation(const uint8_t* msg, size_t n, const KeyPair& me, const 
 bool hsCreateResponse(const HsRespIn& in, const KeyPair& me, const uint8_t Si[32], const uint8_t psk[32],
                       uint32_t localIdx, uint8_t* msg2, TransportKeys& keys);
 
-void derivePsk(uint8_t psk[32], const char* password, size_t len, const uint8_t sid[8]);
 void deriveSid(uint8_t sid[8], const uint8_t pubA[32], const uint8_t pubB[32]);
 
 struct ReplayWindow {

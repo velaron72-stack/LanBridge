@@ -48,6 +48,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -56,7 +57,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -78,6 +78,7 @@ fun MainScreen() {
     val ctx = LocalContext.current
     val ui by TunnelController.ui.collectAsStateWithLifecycle()
     var sheet by remember { mutableStateOf(Sheet.NONE) }
+    var showStartup by rememberSaveable { mutableStateOf(true) }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
 
     LaunchedEffect(Unit) {
@@ -111,7 +112,7 @@ fun MainScreen() {
     }
 
     fun onConnect() {
-        val err = TunnelController.prepareConnect(ui.password)
+        val err = TunnelController.prepareConnect()
         if (err != null) {
             TunnelController.reportError(err)
             return
@@ -174,13 +175,24 @@ fun MainScreen() {
             }
 
             Text(
-                "Туннель работает на уровне IP без root: пересылаются unicast, broadcast и multicast. " +
-                    "Приложения, привязанные к интерфейсу Wi-Fi, и протоколы не поверх IP работать не будут.",
+                "LanBridge ${SysActions.versionName(ctx)}. Туннель работает на уровне IP без root: пересылаются " +
+                    "unicast, broadcast и multicast. Приложения, привязанные к интерфейсу Wi-Fi, и протоколы не " +
+                    "поверх IP работать не будут.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp, bottom = 16.dp),
             )
         }
+    }
+
+    if (showStartup) {
+        StartupDialog(
+            onOk = { showStartup = false },
+            onSettings = {
+                showStartup = false
+                sheet = Sheet.SETTINGS
+            },
+        )
     }
 
     when (sheet) {
@@ -385,22 +397,6 @@ private fun SetupSection(
         }
     }
 
-    SectionCard("3. Пароль комнаты (необязательно)") {
-        OutlinedTextField(
-            value = ui.password,
-            onValueChange = { TunnelController.setPassword(it) },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-            visualTransformation = PasswordVisualTransformation(),
-            label = { Text("Одинаковый у обоих") },
-        )
-        Text(
-            "Если задан, без него соединение не установится. Передайте пароль отдельным каналом.",
-            style = small,
-            color = muted,
-        )
-    }
-
     val canConnect = ui.phase == Phase.READY && ui.myCode != null && ui.friend != null && !ui.busy
     Button(
         onClick = onConnect,
@@ -477,6 +473,8 @@ private fun StatusCard(ui: UiState) {
                 Line("Ваш адрес", l.my)
                 Line("Адрес друга", l.peer)
                 Line("Сеть", "${l.net}/${l.prefix}")
+                if (l.realMine.isNotEmpty()) Line("Ваш реальный адрес", l.realMine.joinToString())
+                if (l.aliasRoutes.isNotEmpty()) Line("Реальный адрес друга", l.aliasRoutes.joinToString())
             }
             if (s != null && (ui.phase == Phase.CONNECTED || ui.phase == Phase.STALLED)) {
                 val path = when (s.pathLocal) {
@@ -490,6 +488,7 @@ private fun StatusCard(ui: UiState) {
                 Line("Трафик", "↓ ${Fmt.bytes(s.rxBytes)} · ↑ ${Fmt.bytes(s.txBytes)}")
                 Line("Broadcast", "↑ ${s.bcastTx} · ↓ ${s.bcastRx}")
                 Line("Multicast", "↑ ${s.mcastTx} · ↓ ${s.mcastRx}")
+                if (s.dropped > 0) Line("Отброшено пакетов", "${s.dropped}")
             }
             val hint = ui.hint
             if (hint != null) {

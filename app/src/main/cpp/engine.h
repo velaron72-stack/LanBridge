@@ -61,12 +61,14 @@ public:
     bool layout(Layout& out);
 
     // Takes ownership of tunFd (closed on failure). 0 = started.
-    int start(int tunFd, const std::string& password, int mtu);
+    int start(int tunFd, int mtu);
     void retry();
     void stop();
 
     void status(int64_t out[STATUS_FIELDS]);
     std::string info();
+    // Diagnostics: drop reasons and the busiest flows crossing the tunnel (text, one item per line).
+    std::string flows();
     std::string lastError();
     int socketFd();
     uint16_t localPort();

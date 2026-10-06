@@ -17,11 +17,12 @@ object Native {
     external fun describeOffer(blob: ByteArray): ByteArray?
     external fun setPeer(blob: ByteArray): Int
     external fun layout(): ByteArray?
-    external fun start(tunFd: Int, password: ByteArray, mtu: Int): Int
+    external fun start(tunFd: Int, mtu: Int): Int
     external fun retry()
     external fun stop()
     external fun status(): LongArray?
     external fun info(): ByteArray?
+    external fun flows(): ByteArray?
     external fun lastError(): ByteArray?
     external fun log(): ByteArray?
     external fun logLine(msg: ByteArray)

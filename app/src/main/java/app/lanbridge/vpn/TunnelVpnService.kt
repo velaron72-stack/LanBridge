@@ -9,6 +9,7 @@ import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -16,6 +17,7 @@ import app.lanbridge.App
 import app.lanbridge.MainActivity
 import app.lanbridge.R
 import app.lanbridge.core.Native
+import app.lanbridge.core.NetLayout
 import app.lanbridge.core.Phase
 import app.lanbridge.core.Prefs
 import app.lanbridge.core.TunnelController
@@ -76,27 +78,56 @@ class TunnelVpnService : VpnService() {
         super.onDestroy()
     }
 
+    /**
+     * Builds the TUN interface. With [withReal] the device's real address becomes the primary address of the tunnel
+     * and the friend's real addresses are routed into it, so programs that bind to or advertise real addresses keep
+     * working; the virtual /24 stays available next to them.
+     */
+    private fun establishTun(layout: NetLayout, mtu: Int, withReal: Boolean): ParcelFileDescriptor? {
+        val b = Builder().setSession("LanBridge").setMtu(mtu)
+        if (withReal) {
+            val primary = layout.realMine.firstOrNull()
+            if (primary != null) b.addAddress(primary, 32)
+        }
+        b.addAddress(layout.my, layout.prefix)
+        b.addRoute(layout.net, layout.prefix)
+        b.addRoute("224.0.0.0", 4)
+        b.addRoute("255.255.255.255", 32)
+        if (withReal) {
+            for (a in layout.aliasRoutes) b.addRoute(a, 32)
+        }
+        if (Build.VERSION.SDK_INT >= 29) b.setMetered(false)
+        return b.establish()
+    }
+
     private fun runTunnel() {
         try {
             val layout = TunnelController.layout ?: throw IllegalStateException("нет данных о сети")
             val prefs = Prefs(this)
             val mtu = prefs.mtu
-            val b = Builder()
-                .setSession("LanBridge")
-                .setMtu(mtu)
-                .addAddress(layout.my, layout.prefix)
-                .addRoute(layout.net, layout.prefix)
-                .addRoute("224.0.0.0", 4)
-                .addRoute("255.255.255.255", 32)
-            if (Build.VERSION.SDK_INT >= 29) b.setMetered(false)
-            val pfd = b.establish() ?: throw IllegalStateException("система не выдала VPN-интерфейс (разрешение отозвано?)")
-            val fd = pfd.detachFd()
-            Native.note("TUN создан: fd=$fd, ${layout.my}/${layout.prefix}, MTU $mtu")
+            val wantReal = layout.realMine.isNotEmpty() || layout.aliasRoutes.isNotEmpty()
+            var pfd: ParcelFileDescriptor? = null
+            var mirrored = false
+            if (wantReal) {
+                try {
+                    pfd = establishTun(layout, mtu, true)
+                    mirrored = pfd != null
+                } catch (t: Throwable) {
+                    Native.note("TUN с реальными адресами не создан: ${t.message}")
+                }
+            }
+            if (pfd == null) pfd = establishTun(layout, mtu, false)
+            val tun = pfd ?: throw IllegalStateException("система не выдала VPN-интерфейс (разрешение отозвано?)")
+            val fd = tun.detachFd()
+            Native.note(
+                "TUN создан: fd=$fd, ${layout.my}/${layout.prefix}, MTU $mtu, " +
+                    (if (mirrored) "реальные адреса: основной ${layout.realMine.firstOrNull() ?: "-"}, маршруты ${layout.aliasRoutes.joinToString()}" else "только виртуальная сеть"),
+            )
             try {
                 protect(Native.socketFd())
             } catch (_: Throwable) {
             }
-            val rc = Native.start(fd, TunnelController.pendingPassword.toByteArray(Charsets.UTF_8), mtu)
+            val rc = Native.start(fd, mtu)
             if (rc != 0) {
                 throw IllegalStateException(Native.text(Native.lastError()).ifBlank { "код ошибки $rc" })
             }
