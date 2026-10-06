@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <deque>
+#include <unordered_map>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -125,15 +126,50 @@ struct Engine::Impl {
     // diagnostics
     uint64_t dropForeignDst = 0, dropNoSession = 0, dropBadHdr = 0, dropRxSrc = 0, dropRxDst = 0, tunWriteErr = 0;
     uint64_t udpQueued = 0, udpDropped = 0;
+    // Flows are aggregated by (direction, protocol, addresses, service port) so that many short-lived connections of
+    // one service share one entry. T: forwarded to the peer, R: delivered to the TUN, X/Y: dropped (TUN / peer side).
     struct Flow {
-        char dir;  // T forwarded to the peer, R delivered to the TUN, X dropped (TUN side), Y dropped (peer side)
+        char dir;
         uint8_t proto;
         uint32_t sip, dip;
-        uint16_t sport, dport;
+        uint16_t svc;  // TCP/UDP: the lower port of the pair; ICMP: the type
         uint64_t pkts, bytes;
+        uint16_t maxLen;
+        uint32_t syn, synack, rst, fin, frags;
+        uint64_t firstMs, lastMs;  // relative to flowEpochMs
+    };
+    struct PktRec {
+        uint32_t tMs;
+        char dir;
+        uint8_t proto, tcpFlags, ipFlags;
+        uint32_t sip, dip;
+        uint16_t sport, dport, len;
     };
     std::vector<Flow> flowTab;
     uint64_t flowOverflow = 0;
+    uint64_t selftestPkts = 0;  // the app's own "Проверка LAN" traffic (port 41377) is counted but not listed
+    uint64_t flowEpochMs = 0;
+    std::vector<PktRec> headRing;  // the first packets after a reset
+    PktRec tailRing[96];           // the most recent packets
+    size_t tailCount = 0;
+
+    // UDP source fixup (what IP_PKTINFO would give a server): the system picks the first address of the TUN as the
+    // source of everything that leaves through it, but a reply must come from the very address the peer used. So the
+    // engine remembers, per (local port, peer address, peer port), which of our addresses a datagram was sent to and
+    // puts that address on the replies.
+    struct UdpAssoc {
+        uint32_t local;
+        uint64_t lastMs;
+    };
+    std::unordered_map<uint64_t, UdpAssoc> udpAssoc;
+    struct FragFix {
+        uint32_t src, dst, newSrc;
+        uint16_t id;
+        uint64_t expMs;
+    };
+    std::vector<FragFix> fragFix;
+    uint64_t lastAssocGcMs = 0;
+    uint64_t udpFixups = 0;
 
     // outgoing datagrams that did not fit into the socket buffer yet
     struct OutPkt {
@@ -230,9 +266,12 @@ struct Engine::Impl {
         bcastTx = bcastRx = mcastTx = mcastRx = 0;
         authFail = punchRx = hsRx = dropped = handshakes = 0;
         dropForeignDst = dropNoSession = dropBadHdr = dropRxSrc = dropRxDst = tunWriteErr = 0;
-        udpQueued = udpDropped = flowOverflow = 0;
-        flowTab.clear();
+        udpQueued = udpDropped = 0;
+        resetFlowsLocked();
         outq.clear();
+        udpAssoc.clear();
+        fragFix.clear();
+        udpFixups = 0;
         rttMs = -1;
         lastRxMs = lastTxMs = 0;
         connectStartMs = connectedSinceMs = 0;
@@ -498,6 +537,7 @@ struct Engine::Impl {
     }
 
     void tick(uint64_t now) {
+        gcAssoc(now);
         uint64_t due = now + 1000;
         int st = state.load();
         if (st == ST_READY) {
@@ -756,32 +796,132 @@ struct Engine::Impl {
     bool isPeerAddr(uint32_t ip) const { return ip == lay.peerIp || inVec(lay.aliasPeer, ip); }
     bool isMyAddr(uint32_t ip) const { return ip == lay.myIp || inVec(lay.aliasMine, ip); }
 
+    void resetFlowsLocked() {
+        flowTab.clear();
+        flowOverflow = 0;
+        selftestPkts = 0;
+        headRing.clear();
+        tailCount = 0;
+        flowEpochMs = nowMs();
+    }
+
+    static uint16_t serviceOf(uint16_t a, uint16_t b) { return a < b ? a : b; }
+
     void noteFlow(char dir, const uint8_t* ip, size_t tot) {
         if (tot < 20) return;
         size_t ihl = (size_t)(ip[0] & 15) * 4;
         uint8_t proto = ip[9];
-        uint16_t sp = 0, dp = 0;
-        bool first = (be16(ip + 6) & 0x1FFF) == 0;
-        if (first && (proto == 6 || proto == 17) && tot >= ihl + 4) {
+        uint16_t fragField = be16(ip + 6);
+        bool firstFrag = (fragField & 0x1FFF) == 0;
+        bool isFrag = (fragField & 0x1FFF) != 0 || (fragField & 0x2000) != 0;
+        uint16_t sp = 0, dp = 0, svc = 0;
+        uint8_t tcpFlags = 0;
+        if (firstFrag && (proto == 6 || proto == 17) && tot >= ihl + 4) {
             sp = be16(ip + ihl);
             dp = be16(ip + ihl + 2);
-        } else if (first && proto == 1 && tot >= ihl + 2) {
-            sp = ip[ihl];
-            dp = ip[ihl + 1];
-        }
-        uint32_t s = be32(ip + 12), d = be32(ip + 16);
-        for (Flow& f : flowTab) {
-            if (f.dir == dir && f.proto == proto && f.sip == s && f.dip == d && f.sport == sp && f.dport == dp) {
-                f.pkts++;
-                f.bytes += tot;
+            if (sp == 41377 || dp == 41377) {
+                selftestPkts++;
                 return;
             }
+            svc = serviceOf(sp, dp);
+            if (proto == 6 && tot >= ihl + 14) tcpFlags = ip[ihl + 13];
+        } else if (firstFrag && proto == 1 && tot >= ihl + 2) {
+            svc = ip[ihl];
         }
-        if (flowTab.size() >= 64) {
-            flowOverflow++;
+        uint32_t s = be32(ip + 12), d = be32(ip + 16);
+        uint64_t rel = nowMs() - flowEpochMs;
+
+        PktRec r{(uint32_t)rel, dir, proto, tcpFlags, (uint8_t)(fragField >> 13), s, d, sp, dp, (uint16_t)(tot > 65535 ? 65535 : tot)};
+        if (headRing.size() < 120) headRing.push_back(r);
+        tailRing[tailCount % (sizeof tailRing / sizeof tailRing[0])] = r;
+        tailCount++;
+
+        Flow* f = nullptr;
+        for (Flow& x : flowTab) {
+            if (x.dir == dir && x.proto == proto && x.sip == s && x.dip == d && x.svc == svc) {
+                f = &x;
+                break;
+            }
+        }
+        if (!f) {
+            if (flowTab.size() >= 256) {
+                // evict the smallest entry so that busy flows are never lost
+                size_t victim = 0;
+                for (size_t k = 1; k < flowTab.size(); k++)
+                    if (flowTab[k].pkts < flowTab[victim].pkts) victim = k;
+                flowTab.erase(flowTab.begin() + (long)victim);
+                flowOverflow++;
+            }
+            flowTab.push_back(Flow{dir, proto, s, d, svc, 0, 0, 0, 0, 0, 0, 0, 0, rel, rel});
+            f = &flowTab.back();
+        }
+        f->pkts++;
+        f->bytes += tot;
+        if (tot > f->maxLen) f->maxLen = (uint16_t)(tot > 65535 ? 65535 : tot);
+        f->lastMs = rel;
+        if (isFrag) f->frags++;
+        if (proto == 6) {
+            if ((tcpFlags & 0x02) && !(tcpFlags & 0x10)) f->syn++;
+            else if ((tcpFlags & 0x02) && (tcpFlags & 0x10)) f->synack++;
+            if (tcpFlags & 0x04) f->rst++;
+            if (tcpFlags & 0x01) f->fin++;
+        }
+    }
+
+    static uint64_t assocKey(uint16_t lport, uint32_t rip, uint16_t rport) {
+        return ((uint64_t)lport << 48) | ((uint64_t)rport << 32) | rip;
+    }
+
+    // Incoming unicast UDP: remember which of our addresses the peer sent it to.
+    void noteUdpIn(const uint8_t* ip, size_t tot) {
+        if (ip[9] != 17) return;
+        size_t ihl = (size_t)(ip[0] & 15) * 4;
+        if ((be16(ip + 6) & 0x1FFF) != 0 || tot < ihl + 8) return;
+        uint32_t src = be32(ip + 12), dst = be32(ip + 16);
+        if (!isMyAddr(dst)) return;
+        uint64_t now = nowMs();
+        if (udpAssoc.size() > 4096) udpAssoc.clear();
+        udpAssoc[assocKey(be16(ip + ihl + 2), src, be16(ip + ihl))] = UdpAssoc{dst, now};
+    }
+
+    // Outgoing unicast UDP: make a reply come from the address the peer used (see udpAssoc).
+    void fixUdpOut(uint8_t* ip, size_t tot, uint64_t now) {
+        if (ip[9] != 17) return;
+        uint16_t fragField = be16(ip + 6);
+        uint32_t src = be32(ip + 12), dst = be32(ip + 16);
+        if ((fragField & 0x1FFF) != 0) {  // a later fragment follows the decision taken for the first one
+            uint16_t id = be16(ip + 4);
+            for (const FragFix& f : fragFix) {
+                if (f.expMs > now && f.src == src && f.dst == dst && f.id == id) {
+                    ipRewriteSrc(ip, tot, f.newSrc);
+                    return;
+                }
+            }
             return;
         }
-        flowTab.push_back(Flow{dir, proto, s, d, sp, dp, 1, (uint64_t)tot});
+        size_t ihl = (size_t)(ip[0] & 15) * 4;
+        if (tot < ihl + 8) return;
+        auto it = udpAssoc.find(assocKey(be16(ip + ihl), dst, be16(ip + ihl + 2)));
+        if (it == udpAssoc.end() || now - it->second.lastMs > 180000) return;
+        uint32_t want = it->second.local;
+        if (want == src) return;
+        if (fragField & 0x2000) {
+            if (fragFix.size() >= 64) fragFix.erase(fragFix.begin());
+            fragFix.push_back(FragFix{src, dst, want, be16(ip + 4), now + 10000});
+        }
+        ipRewriteSrc(ip, tot, want);
+        udpFixups++;
+    }
+
+    void gcAssoc(uint64_t now) {
+        if (now - lastAssocGcMs < 30000) return;
+        lastAssocGcMs = now;
+        for (auto it = udpAssoc.begin(); it != udpAssoc.end();) {
+            if (now - it->second.lastMs > 180000) it = udpAssoc.erase(it);
+            else ++it;
+        }
+        fragFix.erase(std::remove_if(fragFix.begin(), fragFix.end(), [now](const FragFix& f) { return f.expMs <= now; }),
+                      fragFix.end());
     }
 
     void deliverIp(const uint8_t* ip, size_t len) {
@@ -813,6 +953,7 @@ struct Engine::Impl {
             noteFlow('Y', ip, tot);
             return;
         }
+        noteUdpIn(ip, tot);
         ssize_t w = write(tunFd, ip, tot);
         if (w < 0) {
             dropped++;
@@ -877,6 +1018,7 @@ struct Engine::Impl {
         // Packets keep their source when it is our virtual or a mirrored real address (replies then match what the
         // application expects); anything else is rewritten to the virtual address.
         if (!isMyAddr(be32(p + 12))) ipRewriteSrc(p, tot, lay.myIp);
+        if (kind == UC) fixUdpOut(p, tot, now);
         uint8_t plain[MAX_PLAIN];
         if (tot + 1 > sizeof plain) return;
         plain[0] = K_IP;
@@ -1068,8 +1210,11 @@ int Engine::start(int tunFd, int mtu) {
 
     memset(s.psk, 0, sizeof s.psk);
     s.dropForeignDst = s.dropNoSession = s.dropBadHdr = s.dropRxSrc = s.dropRxDst = s.tunWriteErr = 0;
-    s.udpQueued = s.udpDropped = s.flowOverflow = 0;
-    s.flowTab.clear();
+    s.udpQueued = s.udpDropped = 0;
+    s.resetFlowsLocked();
+    s.udpAssoc.clear();
+    s.fragFix.clear();
+    s.udpFixups = 0;
     s.outq.clear();
     s.tunFd = tunFd;
     s.mtu = mtu;
@@ -1182,34 +1327,83 @@ std::string Engine::info() {
     return o;
 }
 
+static const char* protoName(uint8_t p) {
+    return p == 6 ? "TCP" : p == 17 ? "UDP" : p == 1 ? "ICMP" : p == 2 ? "IGMP" : "IP";
+}
+
+static std::string pktLine(const char* tag, uint32_t tMs, char dir, uint8_t proto, uint32_t sip, uint32_t dip,
+                           uint16_t sp, uint16_t dp, uint16_t len, uint8_t tcpFlags, uint8_t ipFlags) {
+    std::string a = ipStr(sip), b = ipStr(dip);
+    if (proto == 6 || proto == 17) {
+        if (sp || dp) {
+            a += ":" + std::to_string(sp);
+            b += ":" + std::to_string(dp);
+        } else {
+            a += " (фрагмент)";
+        }
+    }
+    std::string fl;
+    if (proto == 6) {
+        if (tcpFlags & 0x02) fl += "S";
+        if (tcpFlags & 0x10) fl += "A";
+        if (tcpFlags & 0x08) fl += "P";
+        if (tcpFlags & 0x01) fl += "F";
+        if (tcpFlags & 0x04) fl += "R";
+    }
+    if (ipFlags & 0x2) fl += (fl.empty() ? "" : " ") + std::string("DF");
+    if (ipFlags & 0x1) fl += (fl.empty() ? "" : " ") + std::string("MF");
+    (void)tag;
+    return strfmt("%7.3f %c %s %s > %s len=%u%s%s\n", tMs / 1000.0, dir, protoName(proto), a.c_str(), b.c_str(),
+                  (unsigned)len, fl.empty() ? "" : " ", fl.c_str());
+}
+
 std::string Engine::flows() {
     Impl& s = *p_;
     std::lock_guard<std::mutex> g(s.mu);
     std::string o = strfmt(
         "drops foreignDst=%llu noSession=%llu badHeader=%llu rxSrc=%llu rxDst=%llu tunWrite=%llu udpQueued=%llu "
-        "udpDropped=%llu flowOverflow=%llu\n",
+        "udpDropped=%llu\n",
         (unsigned long long)s.dropForeignDst, (unsigned long long)s.dropNoSession, (unsigned long long)s.dropBadHdr,
         (unsigned long long)s.dropRxSrc, (unsigned long long)s.dropRxDst, (unsigned long long)s.tunWriteErr,
-        (unsigned long long)s.udpQueued, (unsigned long long)s.udpDropped, (unsigned long long)s.flowOverflow);
+        (unsigned long long)s.udpQueued, (unsigned long long)s.udpDropped);
+    o += strfmt("проверка LAN (порт 41377, в списках не показана): %llu пакетов; вытеснено записей: %llu; с момента сброса: %.1f с\n",
+                (unsigned long long)s.selftestPkts, (unsigned long long)s.flowOverflow,
+                (nowMs() - s.flowEpochMs) / 1000.0);
+    o += strfmt("подмен источника в ответах UDP: %llu; запомнено потоков UDP: %u\n", (unsigned long long)s.udpFixups,
+                (unsigned)s.udpAssoc.size());
     std::vector<Impl::Flow> v = s.flowTab;
     std::sort(v.begin(), v.end(), [](const Impl::Flow& a, const Impl::Flow& b) { return a.bytes > b.bytes; });
-    for (size_t i = 0; i < v.size() && i < 30; i++) {
+    o += "\nПотоки (T: в туннель, R: из туннеля, X/Y: отброшено), порт = меньший из пары:\n";
+    if (v.empty()) o += "(нет)\n";
+    for (size_t i = 0; i < v.size() && i < 60; i++) {
         const Impl::Flow& f = v[i];
-        const char* pn = f.proto == 6 ? "TCP" : f.proto == 17 ? "UDP" : f.proto == 1 ? "ICMP" : f.proto == 2 ? "IGMP" : "IP";
-        std::string a = ipStr(f.sip), b = ipStr(f.dip);
-        if (f.proto == 6 || f.proto == 17) {
-            if (f.sport == 0 && f.dport == 0) {
-                a += ":frag";
-                b += ":frag";
-            } else {
-                a += ":" + std::to_string(f.sport);
-                b += ":" + std::to_string(f.dport);
-            }
-        }
-        o += strfmt("%c %s %s > %s pkts=%llu bytes=%llu\n", f.dir, pn, a.c_str(), b.c_str(), (unsigned long long)f.pkts,
-                    (unsigned long long)f.bytes);
+        std::string extra;
+        if (f.proto == 6) extra = strfmt(" SYN=%u SYN-ACK=%u RST=%u FIN=%u", f.syn, f.synack, f.rst, f.fin);
+        if (f.frags) extra += strfmt(" фрагментов=%u", f.frags);
+        std::string port = (f.proto == 6 || f.proto == 17) ? strfmt(" порт %u", (unsigned)f.svc)
+                           : f.proto == 1                  ? strfmt(" тип %u", (unsigned)f.svc)
+                                                           : std::string();
+        o += strfmt("%c %s %s > %s%s пакетов=%llu байт=%llu макс=%u %.1f..%.1f с%s\n", f.dir, protoName(f.proto),
+                    ipStr(f.sip).c_str(), ipStr(f.dip).c_str(), port.c_str(), (unsigned long long)f.pkts,
+                    (unsigned long long)f.bytes, (unsigned)f.maxLen, f.firstMs / 1000.0, f.lastMs / 1000.0,
+                    extra.c_str());
+    }
+    o += strfmt("\nПервые пакеты (%u):\n", (unsigned)s.headRing.size());
+    for (const Impl::PktRec& r : s.headRing)
+        o += pktLine("h", r.tMs, r.dir, r.proto, r.sip, r.dip, r.sport, r.dport, r.len, r.tcpFlags, r.ipFlags);
+    size_t cap = sizeof s.tailRing / sizeof s.tailRing[0];
+    size_t n = s.tailCount < cap ? s.tailCount : cap;
+    o += strfmt("\nПоследние пакеты (%u из %llu):\n", (unsigned)n, (unsigned long long)s.tailCount);
+    for (size_t i = 0; i < n; i++) {
+        const Impl::PktRec& r = s.tailRing[(s.tailCount - n + i) % cap];
+        o += pktLine("t", r.tMs, r.dir, r.proto, r.sip, r.dip, r.sport, r.dport, r.len, r.tcpFlags, r.ipFlags);
     }
     return o;
+}
+
+void Engine::resetFlows() {
+    std::lock_guard<std::mutex> g(p_->mu);
+    p_->resetFlowsLocked();
 }
 
 std::string Engine::lastError() {

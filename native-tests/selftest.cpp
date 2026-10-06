@@ -762,13 +762,26 @@ static void testAliasEngine() {
     sendTun(A, bc);
     CHECK(readPkt(B.tun.testFd, got, 2000) && got == bc);
 
+    // reply fixup: A talks to the virtual address of B, and B answers from its real address (the source Android picks)
+    auto q1 = mkUdp(ra, lb2.myIp, 4001, 6001, "request to the virtual address");
+    sendTun(A, q1);
+    CHECK(readPkt(B.tun.testFd, got, 2000) && got == q1);
+    auto q2 = mkUdp(rb, ra, 6001, 4001, "reply from the real address");
+    sendTun(B, q2);
+    CHECK(readPkt(A.tun.testFd, got, 2000));
+    CHECK(be32(&got[12]) == lb2.myIp && checksumsOk(got));  // the source is put back to the address A used
+    auto q3 = mkUdp(rb, ra, 6002, 4002, "no request before: left alone");
+    sendTun(B, q3);
+    CHECK(readPkt(A.tun.testFd, got, 2000) && got == q3);
+
     sendTun(A, mkUdp(ra, rb + 1, 1, 2, "not mirrored"));   // another address of the peer's network: not ours to carry
     CHECK(!readPkt(B.tun.testFd, got, 300));
     sendTun(A, mkUdp(0x01020304u, rb, 1, 2, "odd source")); // rewritten to the virtual address
     CHECK(readPkt(B.tun.testFd, got, 2000) && be32(&got[12]) == la.myIp && checksumsOk(got));
 
     std::string fl = A.e.flows();
-    CHECK(fl.find("T UDP 192.168.1.5:5000 > 10.20.30.7:6000") != std::string::npos);
+    CHECK(fl.find("T UDP 192.168.1.5 > 10.20.30.7 порт 5000 пакетов=") != std::string::npos);
+    CHECK(fl.find("Первые пакеты") != std::string::npos && fl.find("Последние пакеты") != std::string::npos);
     CHECK(fl.find("foreignDst=1") != std::string::npos);
     A.e.stop();
     B.e.stop();

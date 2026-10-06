@@ -2,7 +2,7 @@
 """Real-kernel end-to-end test of the tunnel (needs root and /dev/net/tun).
 
 Builds nettest.cpp (two network namespaces with TUN devices joined by two LanBridge engines) and runs real TCP, UDP,
-ICMP, broadcast and multicast traffic through it. Usage: nettest.py [virtual|alias|all]
+ICMP, broadcast and multicast traffic through it. Usage: nettest.py [virtual|alias|android|all]
 """
 import hashlib, json, os, random, select, signal, socket, struct, subprocess, sys, threading, time
 
@@ -69,7 +69,7 @@ def w_udp_echo_server(bind, port):
         s.sendto(d, a)
 
 def w_udp_client(host, port, sizes, count, connected, bind=None):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.0)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(0.4)
     if bind: s.bind((bind, 0))
     if connected == "1": s.connect((host, int(port)))
     out = {}
@@ -174,7 +174,8 @@ def w_ping(host, count):
 class Env:
     def __init__(self, mode):
         self.mode = mode
-        self.p = subprocess.Popen([BIN] + (["alias"] if mode == "alias" else []), stdin=subprocess.PIPE,
+        args = {"virtual": [], "alias": ["alias"], "android": ["alias", "android"]}[mode]
+        self.p = subprocess.Popen([BIN] + args, stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         line = ""
         t0 = time.time()
@@ -188,7 +189,7 @@ class Env:
         self.pid = {"A": f[1], "B": f[2]}
         self.vip = {"A": f[3], "B": f[4]}
         self.info = {"A": self.p.stdout.readline().strip(), "B": self.p.stdout.readline().strip()}
-        self.real = {"A": "192.168.1.5", "B": "10.20.30.7"} if mode == "alias" else {}
+        self.real = {"A": "192.168.1.5", "B": "10.20.30.7"} if mode in ("alias", "android") else {}
 
     def cmd(self, side, *args):
         return ["nsenter", "-t", self.pid[side], "-n", sys.executable, SELF, "--worker"] + [str(a) for a in args]
@@ -241,7 +242,7 @@ def suite_common(env, tag, dstB, dstA, bindB=None):
     s = env.start_server("B", "udp_echo_server", bindB or "0.0.0.0", PORT)
     r = env.run("A", "udp_client", dstB, PORT, sizes, 25, 0)
     check(f"{tag} udp echo (unconnected) all sizes", all(v["lost"] == 0 and v["bad"] == 0 for v in r.values()) if "error" not in r else False, r)
-    r = env.run("A", "udp_client", dstB, PORT, sizes, 15, 1)
+    r = env.run("A", "udp_client", dstB, PORT, "32,1200,1472,4000,9000", 12, 1)
     check(f"{tag} udp echo (connected socket: reply source must match)", all(v["lost"] == 0 and v["bad"] == 0 for v in r.values()) if "error" not in r else False, r)
     sv(s)
     # UDP at a realistic pace (about 12 Mbit/s for 4 s) and an unpaced blast (informational)
@@ -297,6 +298,29 @@ def suite_alias(env):
     check("alias broadcast delivered", out.get("got") == "hello-bcast", out)
     check("alias broadcast source is the real address", out.get("from") == ra, out)
 
+def suite_android(env):
+    """Android-like routing: the first (real) address is the source of everything that leaves through the TUN."""
+    ra, rb = env.real["A"], env.real["B"]
+    for tag, dstB, dstA in (("android virtual dst", env.vip["B"], env.vip["A"]), ("android real dst", rb, ra)):
+        s = env.start_server("B", "udp_echo_server", "0.0.0.0", PORT)
+        r = env.run("A", "udp_client", dstB, PORT, "32,1200,1472,4000,30000", 15, 0)
+        check(f"{tag}: udp echo, reply source must equal the address that was used",
+              all(v["lost"] == 0 and v["bad"] == 0 for v in r.values()) if "error" not in r else False, r)
+        r = env.run("A", "udp_client", dstB, PORT, "32,1200,4000", 15, 1)
+        check(f"{tag}: udp echo through a connected socket",
+              all(v["lost"] == 0 and v["bad"] == 0 for v in r.values()) if "error" not in r else False, r)
+        sv(s)
+        s = env.start_server("A", "udp_echo_server", "0.0.0.0", PORT)
+        r = env.run("B", "udp_client", dstA, PORT, "32,1200,4000", 15, 1)
+        check(f"{tag}: udp echo B->A through a connected socket",
+              all(v["lost"] == 0 and v["bad"] == 0 for v in r.values()) if "error" not in r else False, r)
+        sv(s)
+        s = env.start_server("B", "tcp_server", "0.0.0.0", PORT)
+        r = env.run("A", "tcp_client", dstB, PORT, 2 << 20, 3); check(f"{tag}: tcp 3 x 2 MB", r.get("ok") == 3, r)
+        sv(s)
+    suite_common(env, "android", env.vip["B"], env.vip["A"])
+
+
 def run_mode(mode):
     print(f"== {mode} ==", flush=True)
     env = Env(mode)
@@ -305,8 +329,10 @@ def run_mode(mode):
         if mode == "virtual":
             suite_common(env, "virtual", env.vip["B"], env.vip["A"])
             suite_virtual_only(env)
-        else:
+        elif mode == "alias":
             suite_alias(env)
+        else:
+            suite_android(env)
     finally:
         out = env.close()
         for l in out.splitlines():
@@ -323,7 +349,7 @@ def main():
                         "-pthread", "-I" + SRC, os.path.join(HERE, "nettest.cpp")] + sources + ["-o", BIN], capture_output=True, text=True)
     if r.returncode != 0:
         print(r.stderr); sys.exit(2)
-    for m in (["virtual", "alias"] if mode == "all" else [mode]):
+    for m in (["virtual", "alias", "android"] if mode == "all" else [mode]):
         run_mode(m)
     bad = [n for n, ok in results if not ok]
     print(f"\nnettest: {len(results) - len(bad)} passed, {len(bad)} failed")

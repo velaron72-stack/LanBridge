@@ -175,7 +175,7 @@ fun MainScreen() {
             }
 
             Text(
-                "LanBridge ${SysActions.versionName(ctx)}. Туннель работает на уровне IP без root: пересылаются " +
+                "LanBridge ${SysActions.versionName(ctx)} (установлено ${SysActions.installedAt(ctx)}). Туннель работает на уровне IP без root: пересылаются " +
                     "unicast, broadcast и multicast. Приложения, привязанные к интерфейсу Wi-Fi, и протоколы не " +
                     "поверх IP работать не будут.",
                 style = MaterialTheme.typography.bodySmall,

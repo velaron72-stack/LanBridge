@@ -10,6 +10,15 @@ import android.os.PowerManager
 import android.provider.Settings
 
 object SysActions {
+    /** "06.10 13:05": when this build was installed, to tell new and old builds apart. */
+    @Suppress("DEPRECATION")
+    fun installedAt(ctx: Context): String = try {
+        val t = ctx.packageManager.getPackageInfo(ctx.packageName, 0).lastUpdateTime
+        java.text.SimpleDateFormat("dd.MM HH:mm", java.util.Locale.getDefault()).format(java.util.Date(t))
+    } catch (_: Exception) {
+        ""
+    }
+
     @Suppress("DEPRECATION")
     fun versionName(ctx: Context): String = try {
         ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: ""

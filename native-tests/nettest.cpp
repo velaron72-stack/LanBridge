@@ -117,6 +117,21 @@ static std::string childDo(const std::string& line) {
         static char dev[] = "lbtun0";
         rt.rt_dev = dev;
         if (ioctl(s, SIOCADDRT, &rt) < 0) res = std::string("err SIOCADDRT ") + strerror(errno);
+    } else if (cmd == "DELROUTE") {
+        std::string ip;
+        int prefix;
+        is >> ip >> prefix;
+        uint32_t v;
+        parseIp(ip, v);
+        rtentry rt{};
+        sockaddr_in d = sa(v), m = sa(maskOf(prefix)), g = sa(0);
+        memcpy(&rt.rt_dst, &d, sizeof d);
+        memcpy(&rt.rt_genmask, &m, sizeof m);
+        memcpy(&rt.rt_gateway, &g, sizeof g);
+        rt.rt_flags = RTF_UP;
+        static char dev[] = "lbtun0";
+        rt.rt_dev = dev;
+        if (ioctl(s, SIOCDELRT, &rt) < 0) res = std::string("err SIOCDELRT ") + strerror(errno);
     } else {
         res = "err unknown";
     }
@@ -203,7 +218,11 @@ static std::vector<std::string> split(const std::string& s, char d) {
 }
 
 int main(int argc, char** argv) {
-    bool alias = argc > 1 && !strcmp(argv[1], "alias");
+    bool alias = false, android = false;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "alias")) alias = true;
+        if (!strcmp(argv[i], "android")) android = true;
+    }
     Child ca = spawn("A"), cb = spawn("B");
     if (ca.tun < 0 || cb.tun < 0) {
         fprintf(stderr, "cannot create TUN in namespaces\n");
@@ -244,6 +263,12 @@ int main(int argc, char** argv) {
             ok &= ctl(c, "ADDR lbtun0 " + ipStr(l.myIp) + " " + std::to_string(l.prefix));
         }
         ok &= ctl(c, "UP lbtun0 1280");
+        if (android) {
+            // Android installs the virtual network as a plain route without a preferred source: every packet that
+            // leaves through the TUN then gets the FIRST address of the interface as its source.
+            ok &= ctl(c, "DELROUTE " + ipStr(l.net) + " " + std::to_string(l.prefix));
+            ok &= ctl(c, "ROUTE " + ipStr(l.net) + " " + std::to_string(l.prefix));
+        }
         ok &= ctl(c, "ROUTE 255.255.255.255 32");
         ok &= ctl(c, "ROUTE 224.0.0.0 4");
         for (const std::string& a : split(aliasPeer, ',')) ok &= ctl(c, "ROUTE " + a + " 32");

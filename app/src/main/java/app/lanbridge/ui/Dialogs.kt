@@ -70,10 +70,11 @@ private const val HELP_TEXT =
         "или раздайте точку доступа.\n" +
         "• Отключите другие VPN: Android разрешает только один.\n\n" +
         "Если игра не стартует\n" +
-        "Сразу после неудачной попытки откройте «Журнал и потоки» (значок с ключом) на обоих устройствах и " +
-        "нажмите «Копировать»: там видно, какой трафик игры проходит через туннель и что отбрасывается. " +
-        "«Проверка LAN» на экране подключения показывает, проходят ли unicast, broadcast, multicast, " +
-        "большие UDP-пакеты и TCP.\n\n" +
+        "На обоих устройствах откройте «Журнал и потоки» (значок с ключом) и нажмите «Сбросить потоки». " +
+        "Запустите игру, дождитесь зависания и снова откройте «Журнал и потоки» → «Копировать». Там видно, " +
+        "какой трафик игры проходит через туннель: порты, размеры пакетов, первые и последние пакеты. " +
+        "Не нажимайте «Проверка LAN» до копирования: она добавляет свой трафик. " +
+        "«Проверка LAN» сама проверяет unicast, broadcast, multicast, большие UDP-пакеты и TCP.\n\n" +
         "Ограничения\n" +
         "• Туннель на уровне IPv4 без root. Игры, привязанные к интерфейсу Wi-Fi или использующие не-IP " +
         "протоколы, не заработают.\n\n" +
@@ -239,8 +240,7 @@ fun SettingsDialog(onDismiss: () -> Unit) {
 private fun readDiag(): String = try {
     val flows = Native.text(Native.flows()).trim()
     val log = Native.text(Native.log()).lines().filter { it.isNotBlank() }.asReversed().joinToString("\n")
-    "== Потоки через туннель ==\n" +
-        "T: в туннель, R: из туннеля, X: отброшено при отправке, Y: отброшено при получении\n" +
+    "== Трафик через туннель ==\n" +
         (if (flows.isEmpty()) "(пока нет)" else flows) +
         "\n\n== Журнал (новые сверху) ==\n" + log
 } catch (_: Throwable) {
@@ -260,7 +260,12 @@ fun LogDialog(onDismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("Закрыть") } },
-        dismissButton = { TextButton(onClick = { SysActions.copy(ctx, text) }) { Text("Копировать") } },
+        dismissButton = {
+            Row {
+                TextButton(onClick = { Native.resetFlows() }) { Text("Сбросить потоки") }
+                TextButton(onClick = { SysActions.copy(ctx, text) }) { Text("Копировать") }
+            }
+        },
         title = { Text("Журнал и потоки") },
         text = {
             Box(Modifier.heightIn(max = 440.dp)) {

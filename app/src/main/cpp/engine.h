@@ -69,6 +69,7 @@ public:
     std::string info();
     // Diagnostics: drop reasons and the busiest flows crossing the tunnel (text, one item per line).
     std::string flows();
+    void resetFlows();
     std::string lastError();
     int socketFd();
     uint16_t localPort();

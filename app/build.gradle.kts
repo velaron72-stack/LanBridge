@@ -17,7 +17,7 @@ android {
         applicationId = "app.lanbridge"
         minSdk = 26
         targetSdk = 34
-        versionCode = 20000
+        versionCode = 20002
         versionName = "2.0.0"
 
         ndk {

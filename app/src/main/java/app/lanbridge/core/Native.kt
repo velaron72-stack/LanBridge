@@ -23,6 +23,7 @@ object Native {
     external fun status(): LongArray?
     external fun info(): ByteArray?
     external fun flows(): ByteArray?
+    external fun resetFlows()
     external fun lastError(): ByteArray?
     external fun log(): ByteArray?
     external fun logLine(msg: ByteArray)

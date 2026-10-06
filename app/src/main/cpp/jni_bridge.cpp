@@ -145,6 +145,13 @@ JNIEXPORT jbyteArray JNICALL Java_app_lanbridge_core_Native_flows(JNIEnv* env, j
     }
 }
 
+JNIEXPORT void JNICALL Java_app_lanbridge_core_Native_resetFlows(JNIEnv*, jobject) {
+    try {
+        engine().resetFlows();
+    } catch (...) {
+    }
+}
+
 JNIEXPORT jbyteArray JNICALL Java_app_lanbridge_core_Native_lastError(JNIEnv* env, jobject) {
     try {
         return fromStr(env, engine().lastError());

@@ -180,7 +180,7 @@ object LanSelfTest {
         }
     }
 
-    private class Probe(val key: String, val label: String, val host: String, val body: Int)
+    private class Probe(val key: String, val label: String, val host: String, val body: Int, val unicast: Boolean = false)
 
     private fun tcpProbe(host: String): String {
         val data = bodyOf(TCP_BYTES)
@@ -211,13 +211,13 @@ object LanSelfTest {
     /** Blocking, up to about ten seconds. Call from a background thread. */
     fun run(layout: NetLayout): String {
         val probes = ArrayList<Probe>()
-        probes += Probe("u", "Unicast ${layout.peer}", layout.peer, 0)
+        probes += Probe("u", "Unicast ${layout.peer}", layout.peer, 0, true)
         val real = layout.aliasRoutes.firstOrNull()
-        if (real != null) probes += Probe("r", "Unicast $real (реальный адрес друга)", real, 0)
+        if (real != null) probes += Probe("r", "Unicast $real (реальный адрес друга)", real, 0, true)
         probes += Probe("b1", "Broadcast 255.255.255.255", "255.255.255.255", 0)
         probes += Probe("b2", "Broadcast ${layout.bcast}", layout.bcast, 0)
         probes += Probe("m", "Multicast $MCAST", MCAST, 0)
-        probes += Probe("f", "UDP $BIG Б (фрагментация IP)", layout.peer, BIG)
+        probes += Probe("f", "UDP $BIG Б (фрагментация IP)", layout.peer, BIG, true)
 
         val ok = LinkedHashMap<String, Long>()
         val err = HashMap<String, String>()
@@ -266,10 +266,15 @@ object LanSelfTest {
                     val parts = String(pkt.data, 0, pkt.length, Charsets.UTF_8).split(' ', limit = 6)
                     if (parts.size >= 5 && parts[0] == "LBR1" && parts[1] == id) {
                         val key = parts[2]
-                        if (parts[4] == "ok") {
-                            if (!ok.containsKey(key)) ok[key] = at - (sentAt["$key#${parts[3]}"] ?: t0)
-                        } else {
+                        val probe = probes.firstOrNull { it.key == key }
+                        val from = pkt.address.hostAddress
+                        if (parts[4] != "ok") {
                             err[key] = "данные искажены"
+                        } else if (probe != null && probe.unicast && from != probe.host) {
+                            // A program with a connected socket or a check of the sender address would drop this reply.
+                            err[key] = "ответ пришёл с адреса $from, а не с ${probe.host}"
+                        } else if (!ok.containsKey(key)) {
+                            ok[key] = at - (sentAt["$key#${parts[3]}"] ?: t0)
                         }
                     }
                 } catch (_: SocketTimeoutException) {
@@ -287,7 +292,7 @@ object LanSelfTest {
         for (p in probes) {
             sb.append('\n').append(p.label).append(" — ")
             val t = ok[p.key]
-            if (t != null) {
+            if (t != null && !err.containsKey(p.key)) {
                 sb.append("OK, ").append(t).append(" мс")
             } else {
                 sb.append("нет ответа")
