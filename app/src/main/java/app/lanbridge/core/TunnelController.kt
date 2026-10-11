@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.SystemClock
+import app.lanbridge.ui.Fmt
 import app.lanbridge.vpn.TunnelVpnService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -46,6 +47,7 @@ data class FriendInfo(
     val expiresAt: Long,
     val nat: Int,
     val candidates: List<String>,
+    val families: Int = 0,  // bit 0: reachable over IPv4, bit 1: over IPv6
 )
 
 data class Stats(
@@ -77,6 +79,7 @@ data class UiState(
     val myCode: String? = null,
     val myExpiresAt: Long = 0L,
     val myNat: Int = 0,
+    val myFamilies: Int = 0,  // bit 0: IPv4, bit 1: IPv6 (what the tunnel's sockets and addresses allow)
     val myCandidates: List<String> = emptyList(),
     val stunAnswered: Int = 0,
     val friendText: String = "",
@@ -174,10 +177,12 @@ object TunnelController {
             val nat = d["nat"]?.toIntOrNull() ?: 0
             val cands = parseCands(d["cands"])
             val stun = info["stun"]?.toIntOrNull() ?: 0
+            val fam = d["families"]?.toIntOrNull() ?: 0
+            Native.note("транспорт: IPv4 ${info["transport4"] ?: "?"}, IPv6 ${info["transport6"] ?: "?"}; код доступен по: ${Fmt.families(fam)}")
             _ui.update {
                 it.copy(
                     busy = false, phase = Phase.READY, myCode = code, myExpiresAt = expires, myNat = nat,
-                    myCandidates = cands, stunAnswered = stun, error = null,
+                    myFamilies = fam, myCandidates = cands, stunAnswered = stun, error = null,
                 )
             }
             validateFriend(_ui.value.friendText)
@@ -274,7 +279,7 @@ object TunnelController {
         layout = null
         _ui.update {
             it.copy(
-                phase = Phase.IDLE, busy = false, myCode = null, myExpiresAt = 0L, myCandidates = emptyList(),
+                phase = Phase.IDLE, busy = false, myCode = null, myExpiresAt = 0L, myFamilies = 0, myCandidates = emptyList(),
                 friendText = "", friend = null, friendError = null, layout = null, stats = null, pathText = "",
                 hint = null, testResult = null, testing = false,
             )
@@ -306,12 +311,28 @@ object TunnelController {
             _ui.update { it.copy(friend = null, friendError = offerErrorText(rc)) }
             return
         }
+        val famFriend = d["families"]?.toIntOrNull() ?: 0
+        if (d["common"] == "0") {
+            // Our code and the friend's code share no protocol (one is IPv4-only, the other IPv6-only): the tunnel
+            // could never come up, so say so now instead of after a timeout.
+            friendBlob = null
+            _ui.update {
+                it.copy(
+                    friend = null,
+                    friendError = "Нет общего протокола: у вас ${Fmt.families(_ui.value.myFamilies)}, у друга ${Fmt.families(famFriend)}. " +
+                        "Нужен хотя бы один общий (IPv4 или IPv6). Подключите телефон к другой сети (например, к общему Wi-Fi) " +
+                        "и создайте код заново",
+                )
+            }
+            return
+        }
         friendBlob = blob
         val f = FriendInfo(
             name = d["name"] ?: "",
             expiresAt = d["expires"]?.toLongOrNull() ?: 0L,
             nat = d["nat"]?.toIntOrNull() ?: 0,
             candidates = parseCands(d["cands"]),
+            families = famFriend,
         )
         _ui.update { it.copy(friend = f, friendError = null) }
     }
@@ -321,7 +342,7 @@ object TunnelController {
         2 -> "Код повреждён: не сошлась контрольная сумма"
         3 -> "Код друга истёк — пусть создаст новый"
         4 -> "Это ваш собственный код"
-        5 -> "Код создан другой сборкой приложения (формат кода изменился: добавлен IPv6). Установите одну и ту же свежую сборку у обоих и создайте коды заново"
+        5 -> "Код создан другой сборкой приложения (формат кода изменился: в сборке 20004 туннель работает и по IPv6). Установите одну и ту же свежую сборку у обоих и создайте коды заново"
         6 -> "Сначала создайте свой код"
         7 -> "В коде нет адресов"
         8 -> "Ваш код истёк — создайте новый"
@@ -357,12 +378,17 @@ object TunnelController {
 
     private fun hintFor(s: Stats, elapsedMs: Long): String? {
         if (elapsedMs < 12000L) return null
+        val ui = _ui.value
+        val v6Common = (ui.myFamilies and (ui.friend?.families ?: 0) and 2) != 0
         return when {
             s.authFail > 0 ->
                 "Пакеты друга приходят, но не проходят проверку: коды из разных сессий. Создайте новые коды у обоих."
-            s.punchRx == 0L && s.hsRx == 0L && (s.myNat == 2 || s.peerNat == 2) ->
-                "Пакеты друга не доходят. Один из NAT симметричный — прямое соединение вряд ли возможно. " +
-                    "Вариант: оба в одном Wi-Fi или один раздаёт точку доступа."
+            s.punchRx == 0L && s.hsRx == 0L && (s.myNat == 2 || s.peerNat == 2) && !v6Common ->
+                "Пакеты друга не доходят. Один из NAT (IPv4) симметричный — прямое соединение вряд ли возможно. " +
+                    "Поможет IPv6 у обоих (включите IPv6 в сети или у оператора) или один Wi-Fi / точка доступа."
+            s.punchRx == 0L && s.hsRx == 0L && v6Common ->
+                "Пакеты друга не доходят ни по IPv4, ни по IPv6. Друг должен нажать «Подключиться» и ввести именно ваш код; " +
+                    "возможно, файрвол роутера или NAT оператора блокирует входящий UDP."
             s.punchRx == 0L && s.hsRx == 0L ->
                 "Пакеты друга не доходят. Друг должен нажать «Подключиться» и ввести именно ваш код; " +
                     "возможно, мешает NAT оператора."

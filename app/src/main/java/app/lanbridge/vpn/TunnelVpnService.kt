@@ -151,9 +151,14 @@ class TunnelVpnService : VpnService() {
                         (if (usedReal) ", реальные: основной ${layout.realMine6.firstOrNull() ?: "-"}, маршруты ${layout.aliasRoutes6.joinToString()}" else "")
                     else "; IPv6 не включён"),
             )
-            try {
-                protect(Native.socketFd())
-            } catch (_: Throwable) {
+            // The tunnel's own UDP sockets (IPv4 and IPv6) must bypass the VPN, or the tunnel would carry itself.
+            for ((family, sfd) in listOf("IPv4" to Native.socketFd(), "IPv6" to Native.socketFd6())) {
+                if (sfd < 0) continue
+                try {
+                    if (!protect(sfd)) Native.note("protect() сокета $family (fd=$sfd) вернул false")
+                } catch (t: Throwable) {
+                    Native.note("protect() сокета $family: ${t.message}")
+                }
             }
             val rc = Native.start(fd, mtu)
             if (rc != 0) {

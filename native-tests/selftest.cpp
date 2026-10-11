@@ -837,7 +837,7 @@ static void testFragReassembler() {
 
 // ------------------------------------------------------------------ offer v3 (IPv6) and layout
 static void testOfferV6() {
-    printf("[offer] version 3, IPv6 layout\n");
+    printf("[offer] version 4, IPv6 layout\n");
     auto ip4 = [](uint32_t a_, uint32_t b_, uint32_t c_, uint32_t d_) { return (a_ << 24) | (b_ << 16) | (c_ << 8) | d_; };
     KeyPair ka, kb;
     crypto::genKeypair(ka.priv, ka.pub);
@@ -855,7 +855,7 @@ static void testOfferV6() {
 
     std::vector<uint8_t> blob;
     CHECK(offerEncode(a, blob));
-    CHECK(blob[0] == 3 && kOfferVersion == 3);
+    CHECK(blob[0] == 4 && kOfferVersion == 4);
     Offer d;
     CHECK(offerDecode(blob.data(), blob.size(), d) == OFFER_OK);
     CHECK(d.v6.size() == 2 && d.v6[0] == a.v6[0] && d.v6[1] == a.v6[1] && d.cands.size() == 1 && d.name == "A");
@@ -870,8 +870,10 @@ static void testOfferV6() {
     many.v6 = {A6("2001:db8::1"), A6("2001:db8::2"), A6("2001:db8::3"), A6("2001:db8::4")};
     std::vector<uint8_t> tmp;
     CHECK(!offerEncode(many, tmp));
-    // codes of version 1 and 2 are rejected as such, not as garbage
+    // codes of versions 1 to 3 are rejected as such, not as garbage
     std::vector<uint8_t> old = blob;
+    old[0] = 3;
+    CHECK(offerDecode(old.data(), old.size(), d) == OFFER_VERSION);
     old[0] = 2;
     CHECK(offerDecode(old.data(), old.size(), d) == OFFER_VERSION);
     old[0] = 1;
@@ -879,10 +881,10 @@ static void testOfferV6() {
     // damaged: the address count says four, the checksum or the length cannot match
     {
         std::vector<uint8_t> bad = blob;
-        bad[bad.size() - 4 - 32 - 1] = 4;
+        bad[bad.size() - 4 - 2 - 32 - 1] = 4;
         CHECK(offerDecode(bad.data(), bad.size(), d) == OFFER_FORMAT);
         bad = blob;
-        bad[bad.size() - 4 - 32 - 1] = 1;
+        bad[bad.size() - 4 - 2 - 32 - 1] = 1;
         CHECK(offerDecode(bad.data(), bad.size(), d) == OFFER_FORMAT);
         bad = blob;
         bad[bad.size() - 10] ^= 1;
@@ -894,7 +896,7 @@ static void testOfferV6() {
     for (int i = 0; i < 3000; i++) {  // random garbage with a valid version byte
         uint8_t g[220];
         randomBytes(g, sizeof g);
-        g[0] = 3;
+        g[0] = 4;
         offerDecode(g, 1 + (size_t)(g[1] % 219), d);
     }
 
@@ -1708,6 +1710,8 @@ static void testApiMisuse() {
     f.stop();
 }
 
+#include "transport_tests.h"
+
 int main() {
     testCrypto();
     testProtocol();
@@ -1722,6 +1726,7 @@ int main() {
     testEngineBigPackets();
     testEngineMss();
     testEngineV6();
+    testTransport();
     testConnectTimeout();
     testRekey();
     printf("\nresult: %d checks passed, %d failed\n", g_pass, g_fail);

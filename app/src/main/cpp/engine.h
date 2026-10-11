@@ -1,4 +1,4 @@
-// LanBridge native core: tunnel engine (UDP socket, STUN, hole punching, handshake, TUN <-> network pump).
+// LanBridge native core: tunnel engine (UDP sockets for IPv4 and IPv6, STUN, hole punching, handshake, TUN <-> network pump).
 #pragma once
 
 #include <cstdint>
@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "offer.h"
+#include "udpio.h"
 
 namespace lb {
 
@@ -49,8 +50,11 @@ public:
     ~Engine();
 
     void setConfig(const Config& c);
+    // Replaces how the UDP sockets are created (tests put a simulated network under the engine). Call before prepare().
+    void setSocketFactory(UdpFactory f);
 
-    // Opens the UDP socket, asks STUN servers for the public address and creates a one-time identity.
+    // Opens the UDP sockets (IPv4 and IPv6; one of them may be unavailable), asks STUN servers for the public
+    // addresses and creates a one-time identity.
     // Returns 0 and fills offerOut on success; 1 socket error, 2 no usable address, 3 busy.
     int prepare(const std::vector<std::string>& stunServers, const std::vector<std::string>& localIps,
                 const std::string& deviceName, int ttlSec, std::vector<uint8_t>& offerOut);
@@ -71,8 +75,10 @@ public:
     std::string flows();
     void resetFlows();
     std::string lastError();
-    int socketFd();
+    int socketFd();   // IPv4 socket, -1 when there is none; the VPN service must protect() it
+    int socketFd6();  // IPv6 socket, -1 when there is none; must be protected as well
     uint16_t localPort();
+    uint16_t localPort6();
 
 private:
     struct Impl;

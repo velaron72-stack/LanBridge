@@ -27,7 +27,8 @@ object Native {
     external fun lastError(): ByteArray?
     external fun log(): ByteArray?
     external fun logLine(msg: ByteArray)
-    external fun socketFd(): Int
+    external fun socketFd(): Int   // IPv4 socket of the tunnel, -1 when there is none
+    external fun socketFd6(): Int  // IPv6 socket of the tunnel, -1 when there is none
 
     fun text(b: ByteArray?): String = if (b == null) "" else String(b, Charsets.UTF_8)
 

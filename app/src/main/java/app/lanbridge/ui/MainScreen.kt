@@ -334,7 +334,12 @@ private fun SetupSection(
                 color = if (left != null) muted else MaterialTheme.colorScheme.error,
             )
             Text(
-                "NAT: ${Fmt.nat(ui.myNat)}",
+                "Доступен по: ${Fmt.families(ui.myFamilies)}",
+                style = small,
+                color = if (ui.myFamilies == 3) muted else warnColor(),
+            )
+            Text(
+                "NAT (IPv4): ${Fmt.nat(ui.myNat)}",
                 style = small,
                 color = if (ui.myNat == 2) warnColor() else muted,
             )
@@ -388,7 +393,12 @@ private fun SetupSection(
                 color = if (left != null) okColor() else MaterialTheme.colorScheme.error,
             )
             Text(
-                "NAT друга: ${Fmt.nat(f.nat)}",
+                "Друг доступен по: ${Fmt.families(f.families)}",
+                style = small,
+                color = if (f.families == 3) muted else warnColor(),
+            )
+            Text(
+                "NAT друга (IPv4): ${Fmt.nat(f.nat)}",
                 style = small,
                 color = if (f.nat == 2) warnColor() else muted,
             )
@@ -488,7 +498,8 @@ private fun StatusCard(ui: UiState) {
                     0 -> "напрямую через интернет"
                     else -> "—"
                 }
-                Line("Путь", if (ui.pathText.isNotEmpty()) "$path (${ui.pathText})" else path)
+                val fam = if (ui.pathText.startsWith("[")) "IPv6" else "IPv4"
+                Line("Путь", if (ui.pathText.isNotEmpty()) "$path, $fam (${ui.pathText})" else path)
                 Line("Задержка", if (s.rttMs >= 0) "${s.rttMs} мс" else "измеряется…")
                 Line("В сети", Fmt.duration(s.connectedSec))
                 Line("Трафик", "↓ ${Fmt.bytes(s.rxBytes)} · ↑ ${Fmt.bytes(s.txBytes)}")

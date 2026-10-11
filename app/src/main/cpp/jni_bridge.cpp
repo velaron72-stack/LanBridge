@@ -189,4 +189,12 @@ JNIEXPORT jint JNICALL Java_app_lanbridge_core_Native_socketFd(JNIEnv*, jobject)
     }
 }
 
+JNIEXPORT jint JNICALL Java_app_lanbridge_core_Native_socketFd6(JNIEnv*, jobject) {
+    try {
+        return (jint)engine().socketFd6();
+    } catch (...) {
+        return -1;
+    }
+}
+
 }  // extern "C"

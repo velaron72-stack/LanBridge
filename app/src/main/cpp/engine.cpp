@@ -17,11 +17,13 @@
 #include <mutex>
 #include <thread>
 
+#include "addr.h"
 #include "crypto.h"
 #include "frag.h"
 #include "ipv6.h"
 #include "protocol.h"
 #include "stun.h"
+#include "udpio.h"
 #include "util.h"
 
 namespace lb {
@@ -29,23 +31,6 @@ namespace lb {
 namespace {
 
 const int kMaxSessions = 4;
-
-sockaddr_in mkAddr(uint32_t ipHost, uint16_t port) {
-    sockaddr_in a;
-    memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_port = htons(port);
-    a.sin_addr.s_addr = htonl(ipHost);
-    return a;
-}
-
-bool sameAddr(const sockaddr_in& a, const sockaddr_in& b) {
-    return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
-}
-
-std::string addrStr(const sockaddr_in& a) {
-    return strfmt("%s:%u", ipStr(ntohl(a.sin_addr.s_addr)).c_str(), (unsigned)ntohs(a.sin_port));
-}
 
 bool offerExpired(const Offer& o) { return wallMs() / 1000 > (uint64_t)o.expiresAt + 120; }
 
@@ -71,8 +56,13 @@ struct Engine::Impl {
     std::atomic<int> state{ST_IDLE};
     std::string lastErr;
 
-    int sock = -1;
-    uint16_t localPort = 0;
+    // The tunnel's own transport: one UDP socket per address family (either may be missing, e.g. a host without
+    // IPv6). Both are protected from the VPN by the caller and polled by the engine thread.
+    UdpFactory factory;
+    std::unique_ptr<UdpSocket> s4, s6;
+    std::string sockErr4, sockErr6;
+    uint64_t txErr4 = 0, txErr6 = 0, noRoute = 0;
+    int lastTxErrno[2] = {0, 0};  // per family: the last send error that was logged
     int wakeFd[2] = {-1, -1};
     std::thread th;
     std::atomic<bool> running{false};
@@ -112,11 +102,12 @@ struct Engine::Impl {
     bool haveLast = false;
     uint8_t lastMsg1[MSG1_LEN];
     uint8_t lastMsg2[MSG2_LEN];
-    sockaddr_in peerAddr;
+    Addr peerAddr;
+    std::vector<Addr> peerCands;  // every address the friend can be tried at (both families), from the code
     bool peerAddrValid = false;
     uint64_t peerAddrMs = 0;
     bool peerLeft = false;
-    std::vector<sockaddr_in> punchSeen;
+    std::vector<Addr> punchSeen;
     uint64_t lastAuthLogMs = 0;
 
     // statistics
@@ -184,7 +175,7 @@ struct Engine::Impl {
 
     // outgoing datagrams that did not fit into the socket buffer yet
     struct OutPkt {
-        sockaddr_in to;
+        Addr to;
         uint16_t len;
         uint8_t data[2048];
     };
@@ -194,7 +185,6 @@ struct Engine::Impl {
         memset(&kp, 0, sizeof kp);
         memset(sid, 0, sizeof sid);
         memset(psk, 0, sizeof psk);
-        memset(&peerAddr, 0, sizeof peerAddr);
         memset(lastMsg1, 0, sizeof lastMsg1);
         memset(lastMsg2, 0, sizeof lastMsg2);
     }
@@ -219,33 +209,37 @@ struct Engine::Impl {
         }
     }
 
+    UdpSocket* sockFor(const Addr& a) { return a.v6 ? s6.get() : s4.get(); }
+    bool haveSocket() const { return s4 || s6; }
+
+    // Opens the missing sockets. IPv4 and IPv6 are independent: the tunnel works with one of them, and a failure of
+    // the other family is only logged (a device or a network without IPv6 is normal).
     bool openSocketLocked() {
-        if (sock >= 0) return true;
-        int s = socket(AF_INET, SOCK_DGRAM, 0);
-        if (s < 0) {
-            lastErr = strfmt("socket: %s", strerror(errno));
+        for (int fam = 0; fam < 2; fam++) {
+            std::unique_ptr<UdpSocket>& slot = fam ? s6 : s4;
+            std::string& why = fam ? sockErr6 : sockErr4;
+            if (slot) continue;
+            std::string err;
+            slot = factory ? factory(fam == 1, err) : openSysUdp(fam == 1, err);
+            if (slot && slot->v6() != (fam == 1)) slot.reset();  // a factory that returned the wrong family
+            if (!slot) {
+                why = err.empty() ? "сокет не создан" : err;
+                LBLOG("транспорт %s недоступен: %s", fam ? "IPv6" : "IPv4", why.c_str());
+            } else {
+                why.clear();
+                LBLOG("транспорт %s: порт %u", fam ? "IPv6" : "IPv4", (unsigned)slot->port());
+            }
+        }
+        if (!haveSocket()) {
+            lastErr = sockErr4.empty() ? sockErr6 : (sockErr6.empty() ? sockErr4 : sockErr4 + "; " + sockErr6);
             return false;
         }
-        int fl = fcntl(s, F_GETFL, 0);
-        fcntl(s, F_SETFL, fl | O_NONBLOCK);
-        fcntl(s, F_SETFD, FD_CLOEXEC);
-        int buf = 4 << 20;
-        setsockopt(s, SOL_SOCKET, SO_RCVBUF, &buf, sizeof buf);
-        setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof buf);
-        sockaddr_in a = mkAddr(0, 0);
-        if (bind(s, (const sockaddr*)&a, sizeof a) < 0) {
-            lastErr = strfmt("bind: %s", strerror(errno));
-            close(s);
-            return false;
-        }
-        socklen_t al = sizeof a;
-        getsockname(s, (sockaddr*)&a, &al);
-        localPort = ntohs(a.sin_port);
         if (wakeFd[0] < 0) {
             if (pipe(wakeFd) < 0) {
                 lastErr = strfmt("pipe: %s", strerror(errno));
-                close(s);
                 wakeFd[0] = wakeFd[1] = -1;
+                s4.reset();
+                s6.reset();
                 return false;
             }
             for (int i = 0; i < 2; i++) {
@@ -253,7 +247,6 @@ struct Engine::Impl {
                 fcntl(wakeFd[i], F_SETFD, FD_CLOEXEC);
             }
         }
-        sock = s;
         return true;
     }
 
@@ -368,12 +361,28 @@ struct Engine::Impl {
     }
 
     // ------------------------------------------------------------ sending
-    void sendRaw(const sockaddr_in& to, const uint8_t* b, size_t n) {
-        if (sock < 0 || n > sizeof(OutPkt::data)) return;
+    bool wouldBlock(int e) const { return e == EAGAIN || e == EWOULDBLOCK || e == ENOBUFS; }
+
+    void noteTxError(const Addr& to, int e) {
+        (to.v6 ? txErr6 : txErr4)++;
+        int& last = lastTxErrno[to.v6 ? 1 : 0];
+        if (last != e) LBLOG("отправка на %s: %s", addrStr(to).c_str(), strerror(e));
+        last = e;
+    }
+
+    void sendRaw(const Addr& to, const uint8_t* b, size_t n) {
+        UdpSocket* us = sockFor(to);
+        if (!us || n > sizeof(OutPkt::data)) {
+            if (!us) noRoute++;
+            return;
+        }
         if (outq.empty()) {
-            ssize_t r = sendto(sock, b, n, MSG_DONTWAIT, (const sockaddr*)&to, sizeof to);
+            ssize_t r = us->sendTo(to, b, n);
             if (r >= 0) return;
-            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOBUFS) return;
+            if (!wouldBlock(errno)) {
+                noteTxError(to, errno);
+                return;
+            }
         }
         if (outq.size() >= 2048) {
             udpDropped++;
@@ -390,16 +399,21 @@ struct Engine::Impl {
     void flushOut() {
         while (!outq.empty()) {
             const OutPkt& p = outq.front();
-            ssize_t r = sendto(sock, p.data, p.len, MSG_DONTWAIT, (const sockaddr*)&p.to, sizeof p.to);
-            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) break;
+            UdpSocket* us = sockFor(p.to);
+            if (us) {
+                ssize_t r = us->sendTo(p.to, p.data, p.len);
+                if (r < 0) {
+                    if (wouldBlock(errno)) break;
+                    noteTxError(p.to, errno);
+                }
+            }
             outq.pop_front();
         }
     }
 
-    void sendToCands(const uint8_t* b, size_t n, const sockaddr_in* skip) {
-        for (const Candidate& c : peer.cands) {
-            sockaddr_in a = mkAddr(c.ip, c.port);
-            if (skip && sameAddr(a, *skip)) continue;
+    void sendToCands(const uint8_t* b, size_t n, const Addr* skip) {
+        for (const Addr& a : peerCands) {
+            if (skip && a == *skip) continue;
             sendRaw(a, b, n);
         }
     }
@@ -453,8 +467,8 @@ struct Engine::Impl {
         sendTransport(s, &b, 1, now);
     }
 
-    void updatePath(const sockaddr_in& src, uint64_t now) {
-        if (!peerAddrValid || !sameAddr(src, peerAddr)) {
+    void updatePath(const Addr& src, uint64_t now) {
+        if (!peerAddrValid || src != peerAddr) {
             LBLOG("путь до друга: %s", addrStr(src).c_str());
             peerAddr = src;
         }
@@ -501,9 +515,11 @@ struct Engine::Impl {
         stunPend.erase(std::remove_if(stunPend.begin(), stunPend.end(),
                                       [now](const StunPend& p) { return now - p.sentMs > 8000; }),
                        stunPend.end());
-        int sent = 0;
-        for (size_t i = 0; i < stun.size() && sent < 2; i++) {
+        int sent[2] = {0, 0};  // at most two servers per address family
+        for (size_t i = 0; i < stun.size(); i++) {
             if (!stun[i].ok) continue;
+            int& cnt = sent[stun[i].addr.v6 ? 1 : 0];
+            if (cnt >= 2) continue;
             StunPend p;
             randomBytes(p.txid, 12);
             p.srv = i;
@@ -512,7 +528,7 @@ struct Engine::Impl {
             stunBuildRequest(req, p.txid);
             sendRaw(stun[i].addr, req, sizeof req);
             stunPend.push_back(p);
-            sent++;
+            cnt++;
         }
     }
 
@@ -521,20 +537,30 @@ struct Engine::Impl {
         while (running.load()) {
             int timeout;
             int tfd;
-            bool wantOut = false;
+            int fd4 = -1, fd6 = -1;
+            bool out4 = false, out6 = false;  // the queue is a FIFO: only the socket of its head packet matters
             {
                 std::lock_guard<std::mutex> g(mu);
-                wantOut = !outq.empty();
+                if (!outq.empty()) (outq.front().to.v6 ? out6 : out4) = true;
+                fd4 = s4 ? s4->fd() : -1;
+                fd6 = s6 ? s6->fd() : -1;
                 int64_t t = (int64_t)nextTickMs - (int64_t)nowMs();
                 if (t < 0) t = 0;
                 if (t > 1000) t = 1000;
                 timeout = (int)t;
                 tfd = tunFd;
             }
-            pollfd fds[3];
-            int nf = 0, ti = -1;
-            fds[nf++] = pollfd{sock, (short)(POLLIN | (wantOut ? POLLOUT : 0)), 0};
+            pollfd fds[4];
+            int nf = 0, ti = -1, i4 = -1, i6 = -1;
             fds[nf++] = pollfd{wakeFd[0], POLLIN, 0};
+            if (fd4 >= 0) {
+                i4 = nf;
+                fds[nf++] = pollfd{fd4, (short)(POLLIN | (out4 ? POLLOUT : 0)), 0};
+            }
+            if (fd6 >= 0) {
+                i6 = nf;
+                fds[nf++] = pollfd{fd6, (short)(POLLIN | (out6 ? POLLOUT : 0)), 0};
+            }
             if (tfd >= 0) {
                 ti = nf;
                 fds[nf++] = pollfd{tfd, POLLIN, 0};
@@ -545,9 +571,10 @@ struct Engine::Impl {
             if (!running.load()) break;
             uint64_t now = nowMs();
             if (r > 0) {
-                if (fds[1].revents & POLLIN) drainWake();
-                if (fds[0].revents & POLLOUT) flushOut();
-                if (fds[0].revents & POLLIN) readUdp(now);
+                if (fds[0].revents & POLLIN) drainWake();
+                if ((i4 >= 0 && (fds[i4].revents & POLLOUT)) || (i6 >= 0 && (fds[i6].revents & POLLOUT))) flushOut();
+                if (i4 >= 0 && (fds[i4].revents & POLLIN) && s4) readUdp(s4.get(), now);
+                if (i6 >= 0 && (fds[i6].revents & POLLIN) && s6) readUdp(s6.get(), now);
                 if (ti >= 0 && tunFd == tfd && fds[ti].revents) readTun(now, fds[ti].revents);
             }
             if (!outq.empty()) flushOut();
@@ -574,7 +601,11 @@ struct Engine::Impl {
                     connectStartMs = now;
                     nextProbeMs = 0;
                 }
-                if (now - connectStartMs >= (uint64_t)cfg.connectTimeoutMs) {
+                if (peerCands.empty()) {
+                    auto fn = [](int f) { return f == 3 ? "IPv4 и IPv6" : f == 2 ? "только IPv6" : f == 1 ? "только IPv4" : "нет"; };
+                    failLocked(strfmt("нет общего сетевого протокола с другом (у вас: %s, у друга: %s)",
+                                      fn(offerFamilies(myOffer)), fn(offerFamilies(peer))));
+                } else if (now - connectStartMs >= (uint64_t)cfg.connectTimeoutMs) {
                     failLocked("друг не ответил за отведённое время");
                 } else {
                     probe(now);
@@ -600,19 +631,18 @@ struct Engine::Impl {
     }
 
     // ------------------------------------------------------------ receiving: UDP
-    void readUdp(uint64_t now) {
+    void readUdp(UdpSocket* us, uint64_t now) {
         uint8_t buf[2600];
         for (int i = 0; i < 256; i++) {
-            sockaddr_in from;
-            socklen_t fl = sizeof from;
-            ssize_t n = recvfrom(sock, buf, sizeof buf, MSG_DONTWAIT, (sockaddr*)&from, &fl);
+            Addr from;
+            ssize_t n = us->recvFrom(buf, sizeof buf, from);
             if (n < 0) break;
             if (n == 0) continue;
             onUdp(buf, (size_t)n, from, now);
         }
     }
 
-    void onUdp(const uint8_t* b, size_t n, const sockaddr_in& src, uint64_t now) {
+    void onUdp(const uint8_t* b, size_t n, const Addr& src, uint64_t now) {
         if (stunIsMessage(b, n)) {
             onStun(b, n);
             return;
@@ -636,13 +666,12 @@ struct Engine::Impl {
             if (memcmp(stunPend[i].txid, tx, 12) != 0) continue;
             size_t si = stunPend[i].srv;
             stunPend.erase(stunPend.begin() + (long)i);
-            StunAddr m;
+            Addr m;
             if (si < stun.size() && stunParseResponse(b, n, tx, m)) {
                 StunServer& s = stun[si];
-                if (s.ok && (s.mapped.ip != m.ip || s.mapped.port != m.port)) {
+                if (s.ok && s.mapped != m) {
                     mappingChanged = true;
-                    LBLOG("STUN: внешний адрес изменился %s:%u -> %s:%u", ipStr(s.mapped.ip).c_str(),
-                          (unsigned)s.mapped.port, ipStr(m.ip).c_str(), (unsigned)m.port);
+                    LBLOG("STUN: внешний адрес изменился %s -> %s", addrStr(s.mapped).c_str(), addrStr(m).c_str());
                     s.mapped = m;
                 }
             }
@@ -650,12 +679,12 @@ struct Engine::Impl {
         }
     }
 
-    void onPunch(const uint8_t* b, size_t n, const sockaddr_in& src) {
+    void onPunch(const uint8_t* b, size_t n, const Addr& src) {
         if (!havePeer || n != PUNCH_LEN || memcmp(b + 1, sid, 8) != 0) return;
         punchRx++;
         bool seen = false;
-        for (const sockaddr_in& a : punchSeen)
-            if (sameAddr(a, src)) seen = true;
+        for (const Addr& a : punchSeen)
+            if (a == src) seen = true;
         if (!seen && punchSeen.size() < 8) {
             punchSeen.push_back(src);
             LBLOG("получен пробный пакет от %s", addrStr(src).c_str());
@@ -671,7 +700,7 @@ struct Engine::Impl {
         }
     }
 
-    void onMsg1(const uint8_t* b, size_t n, const sockaddr_in& src, uint64_t now) {
+    void onMsg1(const uint8_t* b, size_t n, const Addr& src, uint64_t now) {
         if (!havePeer || initiator || n != MSG1_LEN) return;
         if (haveLast && memcmp(b, lastMsg1, MSG1_LEN) == 0) {  // retransmission: repeat the same answer
             sendRaw(src, lastMsg2, MSG2_LEN);
@@ -712,7 +741,7 @@ struct Engine::Impl {
         LBLOG("получен запрос соединения от %s", addrStr(src).c_str());
     }
 
-    void onMsg2(const uint8_t* b, size_t n, const sockaddr_in& src, uint64_t now) {
+    void onMsg2(const uint8_t* b, size_t n, const Addr& src, uint64_t now) {
         if (!havePeer || !initiator || !pend.active || n != MSG2_LEN) return;
         uint32_t myIdx = pend.localIdx;
         uint32_t remoteIdx = 0;
@@ -746,7 +775,7 @@ struct Engine::Impl {
         sendKeepalive(s, now);  // confirms the new keys to the responder
     }
 
-    void onData(const uint8_t* b, size_t n, const sockaddr_in& src, uint64_t now) {
+    void onData(const uint8_t* b, size_t n, const Addr& src, uint64_t now) {
         if (n < DATA_HDR + AEAD_TAG) return;
         Session* s = findSession(le32(b + 1));
         if (!s) {
@@ -1324,43 +1353,51 @@ int Engine::prepare(const std::vector<std::string>& stunServers, const std::vect
     }
 
     std::vector<StunServer> servers = stunResolveAll(stunServers, 2500);
-    int answered = stunGather(s.sock, servers, s.cfg.stunTimeoutMs);
+    int answered = stunGather(s.s4.get(), s.s6.get(), servers, s.cfg.stunTimeoutMs);
     LBLOG("STUN: ответили %d из %d (запрошено %d)", answered, (int)servers.size(), (int)stunServers.size());
 
     std::lock_guard<std::mutex> g(s.mu);
     s.stun.clear();
     for (const StunServer& sv : servers)
         if (sv.ok) s.stun.push_back(sv);
-    std::vector<StunAddr> distinct;
+    // Public addresses, one entry per distinct address. The NAT type comes from IPv4 servers only: IPv6 normally has
+    // no address translation, so its answers say nothing about it.
+    std::vector<Addr> distinct;
+    std::vector<Addr> distinct4Servers;
+    int servers4 = 0;
     for (const StunServer& sv : s.stun) {
-        bool dup = false;
-        for (const StunAddr& a : distinct)
-            if (a.ip == sv.mapped.ip && a.port == sv.mapped.port) dup = true;
-        if (!dup) distinct.push_back(sv.mapped);
+        if (std::find(distinct.begin(), distinct.end(), sv.mapped) == distinct.end()) distinct.push_back(sv.mapped);
+        if (!sv.addr.v6) {
+            servers4++;
+            if (std::find(distinct4Servers.begin(), distinct4Servers.end(), sv.mapped) == distinct4Servers.end())
+                distinct4Servers.push_back(sv.mapped);
+        }
     }
     int nat = 0;
-    if (s.stun.size() >= 2) nat = distinct.size() == 1 ? 1 : 2;
+    if (servers4 >= 2) nat = distinct4Servers.size() == 1 ? 1 : 2;
     s.myNat = nat;
-    for (const StunAddr& a : distinct) LBLOG("внешний адрес: %s:%u", ipStr(a.ip).c_str(), (unsigned)a.port);
-    LBLOG("тип NAT: %s", nat == 1 ? "конусный (EIM)" : nat == 2 ? "симметричный (EDM)" : "не определён");
+    for (const Addr& a : distinct) LBLOG("внешний адрес: %s", addrStr(a).c_str());
+    LBLOG("тип NAT (IPv4): %s", nat == 1 ? "конусный (EIM)" : nat == 2 ? "симметричный (EDM)" : "не определён");
 
     Offer o;
     o.version = kOfferVersion;
     o.expiresAt = (uint32_t)(wallMs() / 1000 + (uint64_t)(ttlSec > 0 ? ttlSec : 600));
     o.nat = (uint8_t)nat;
     o.name = sanitize(deviceName, 24);
+    o.port6 = s.s6 ? s.s6->port() : 0;
     std::vector<uint32_t> seen;
     for (const std::string& t : localIps) {
         uint32_t ip;
         if (parseIp(t, ip)) {
-            if (ip == 0) continue;
+            if (ip == 0 || !s.s4) continue;
             if (std::find(seen.begin(), seen.end(), ip) != seen.end()) continue;
             if (seen.size() >= 4) continue;
             seen.push_back(ip);
-            o.cands.push_back(Candidate{0, ip, s.localPort});
+            o.cands.push_back(Candidate{0, ip, s.s4->port()});
             continue;
         }
-        // IPv6: only addresses that can be used across the tunnel (global or unique-local), at most three
+        // IPv6: only addresses that can be used across the tunnel (global or unique-local), at most three. They are
+        // mirrored through the tunnel and, together with the port of the IPv6 socket, are the IPv6 host candidates.
         Ip6 a6;
         if (!parseIp6(t, a6)) continue;
         if (ip6IsUnspecified(a6) || ip6IsLoopback(a6) || ip6IsLinkLocal(a6) || ip6IsMulticast(a6) || ip6IsV4Mapped(a6))
@@ -1368,8 +1405,29 @@ int Engine::prepare(const std::vector<std::string>& stunServers, const std::vect
         if (o.v6.size() >= 3 || std::find(o.v6.begin(), o.v6.end(), a6) != o.v6.end()) continue;
         o.v6.push_back(a6);
     }
-    for (size_t i = 0; i < distinct.size() && i < 2; i++) o.cands.push_back(Candidate{1, distinct[i].ip, distinct[i].port});
-    if (o.cands.empty()) {
+    // Public (server reflexive) candidates: up to two per family. An IPv6 one that the code already implies (an
+    // address of the list with the IPv6 port) is not written twice.
+    int n4 = 0, n6 = 0;
+    for (const Addr& a : distinct) {
+        int& cnt = a.v6 ? n6 : n4;
+        if (cnt >= 2 || !addrUsablePeer(a)) continue;
+        if (a.v6) {
+            bool implied = false;
+            for (const Ip6& x : o.v6) implied |= (x == a.ip6 && o.port6 == a.port);
+            if (implied) {
+                cnt++;
+                continue;
+            }
+            Candidate c{1, 0, a.port};
+            c.v6 = true;
+            c.ip6 = a.ip6;
+            o.cands.push_back(c);
+        } else {
+            o.cands.push_back(Candidate{1, a.ip4, a.port});
+        }
+        cnt++;
+    }
+    if (offerCandidates(o).empty()) {
         s.lastErr = "нет сетевых адресов";
         s.setState(ST_IDLE);
         return 2;
@@ -1387,8 +1445,9 @@ int Engine::prepare(const std::vector<std::string>& stunServers, const std::vect
     s.nextTickMs = 0;
     s.setState(ST_READY);
     s.startThreadLocked();
-    LBLOG("код создан: кандидатов %d, адресов IPv6 %d, действует до %u", (int)o.cands.size(), (int)o.v6.size(),
-          (unsigned)o.expiresAt);
+    int fam = offerFamilies(o);
+    LBLOG("код создан: кандидатов %d, адресов IPv6 %d, доступность: %s, действует до %u", (int)offerCandidates(o).size(),
+          (int)o.v6.size(), fam == 3 ? "IPv4 и IPv6" : fam == 2 ? "только IPv6" : "только IPv4", (unsigned)o.expiresAt);
     return 0;
 }
 
@@ -1405,14 +1464,20 @@ int Engine::describe(const std::vector<uint8_t>& blob, std::string& text) {
     }
     if (rc == OFFER_OK && offerExpired(o)) rc = OFFER_EXPIRED;
     std::string c;
-    for (const Candidate& k : o.cands) {
+    for (const Candidate& k : offerCandidates(o, false)) {
         if (!c.empty()) c += ",";
-        c += strfmt("%s:%s:%u", k.type == 0 ? "host" : "srflx", ipStr(k.ip).c_str(), (unsigned)k.port);
+        c += strfmt("%s:%s", k.type == 0 ? "host" : "srflx", addrStr(candAddr(k)).c_str());
     }
     std::string v6;
     for (const Ip6& a : o.v6) v6 += (v6.empty() ? "" : ",") + ip6Str(a);
-    text = strfmt("code=%d\nname=%s\nexpires=%u\nnat=%d\ncands=%s\nv6=%s\n", rc, o.name.c_str(),
-                  (unsigned)o.expiresAt, (int)o.nat, c.c_str(), v6.c_str());
+    int fam = offerFamilies(o);
+    int common = -1;  // -1: our own code is not made yet
+    {
+        std::lock_guard<std::mutex> g(p_->mu);
+        if (p_->haveIdentity) common = (offerFamilies(p_->myOffer) & fam) != 0 ? 1 : 0;
+    }
+    text = strfmt("code=%d\nname=%s\nexpires=%u\nnat=%d\ncands=%s\nv6=%s\nfamilies=%d\ncommon=%d\n", rc,
+                  o.name.c_str(), (unsigned)o.expiresAt, (int)o.nat, c.c_str(), v6.c_str(), fam, common);
     return rc;
 }
 
@@ -1428,12 +1493,29 @@ int Engine::setPeer(const std::vector<uint8_t>& blob) {
     if (offerExpired(o)) return OFFER_EXPIRED;
     s.peer = o;
     s.havePeer = true;
+    s.peerCands.clear();
+    int skipped = 0;
+    for (const Candidate& k : offerCandidates(o)) {
+        Addr a = candAddr(k);
+        if (s.sockFor(a)) {
+            s.peerCands.push_back(a);
+        } else {
+            skipped++;  // a family this device has no socket for: nothing could be sent there
+        }
+    }
+    if (skipped) LBLOG("кандидатов другого семейства пропущено: %d (нет сокета)", skipped);
     s.lay = computeLayout(s.myOffer, s.peer);
     s.initiator = s.lay.initiator;
     deriveSid(s.sid, s.kp.pub, s.peer.pub);
     LBLOG("друг: \"%s\", кандидатов %d, NAT %d; сеть %s/%d, мой %s, друг %s, роль %s", s.peer.name.c_str(),
-          (int)s.peer.cands.size(), (int)s.peer.nat, ipStr(s.lay.net).c_str(), s.lay.prefix, ipStr(s.lay.myIp).c_str(),
+          (int)s.peerCands.size(), (int)s.peer.nat, ipStr(s.lay.net).c_str(), s.lay.prefix, ipStr(s.lay.myIp).c_str(),
           ipStr(s.lay.peerIp).c_str(), s.initiator ? "инициатор" : "ответчик");
+    {
+        int mine = offerFamilies(s.myOffer), theirs = offerFamilies(s.peer);
+        auto fn = [](int f) { return f == 3 ? "IPv4+IPv6" : f == 2 ? "IPv6" : f == 1 ? "IPv4" : "нет"; };
+        LBLOG("доступность: у меня %s, у друга %s%s", fn(mine), fn(theirs),
+              (mine & theirs) ? "" : " — общего протокола нет, соединение невозможно");
+    }
     LBLOG("IPv6: сеть %s/%d, мой %s, друг %s; реальных адресов у друга %d, у меня %d", ip6Str(s.lay.net6).c_str(),
           s.lay.prefix6, ip6Str(s.lay.myIp6).c_str(), ip6Str(s.lay.peerIp6).c_str(), (int)s.lay.aliasPeer6.size(),
           (int)s.lay.aliasMine6.size());
@@ -1456,7 +1538,7 @@ int Engine::start(int tunFd, int mtu) {
         LBLOG("старт отклонён: %s", msg);
         return code;
     };
-    if (s.state.load() != ST_READY || !s.haveIdentity || !s.havePeer || s.sock < 0) return fail(1, "движок не готов к запуску");
+    if (s.state.load() != ST_READY || !s.haveIdentity || !s.havePeer || !s.haveSocket()) return fail(1, "движок не готов к запуску");
     if (offerExpired(s.myOffer)) return fail(2, "ваш код истёк");
     if (offerExpired(s.peer)) return fail(3, "код друга истёк");
     if (tunFd < 0) return fail(4, "нет TUN-интерфейса");
@@ -1515,16 +1597,14 @@ void Engine::stopInternal() {
     {
         std::lock_guard<std::mutex> g(s.mu);
         int st = s.state.load();
-        if ((st == ST_CONNECTED || st == ST_STALLED) && s.sock >= 0) s.sendBye(nowMs());
+        if ((st == ST_CONNECTED || st == ST_STALLED) && s.haveSocket()) s.sendBye(nowMs());
     }
     s.stopThread();
     std::lock_guard<std::mutex> g(s.mu);
     s.resetRuntimeLocked();
-    if (s.sock >= 0) {
-        close(s.sock);
-        s.sock = -1;
-        s.localPort = 0;
-    }
+    s.s4.reset();
+    s.s6.reset();
+    s.peerCands.clear();
     for (int i = 0; i < 2; i++) {
         if (s.wakeFd[i] >= 0) close(s.wakeFd[i]);
         s.wakeFd[i] = -1;
@@ -1557,7 +1637,7 @@ void Engine::status(int64_t out[STATUS_FIELDS]) {
     out[5] = s.rttMs;
     out[6] = s.lastRxMs ? (int64_t)(now - s.lastRxMs) : -1;
     out[7] = (s.connectedSinceMs && (st == ST_CONNECTED || st == ST_STALLED)) ? (int64_t)((now - s.connectedSinceMs) / 1000) : 0;
-    out[8] = s.peerAddrValid ? (isPrivateIp(ntohl(s.peerAddr.sin_addr.s_addr)) ? 1 : 0) : -1;
+    out[8] = s.peerAddrValid ? (addrIsLocalNet(s.peerAddr) ? 1 : 0) : -1;
     out[9] = (int64_t)s.bcastTx;
     out[10] = (int64_t)s.bcastRx;
     out[11] = (int64_t)s.mcastTx;
@@ -1594,11 +1674,16 @@ std::string Engine::info() {
                     ip6Str(s.lay.peerIp6).c_str(), ip6Str(s.lay.net6).c_str(), s.lay.prefix6);
         o += "realIp6=" + ra6 + "\naliasPeer6=" + ap6 + "\n";
     }
-    o += strfmt("localPort=%u\nstun=%d\nmtu=%d\n", (unsigned)s.localPort, (int)s.stun.size(), s.mtu);
+    o += strfmt("localPort=%u\nlocalPort6=%u\nstun=%d\nmtu=%d\n", (unsigned)(s.s4 ? s.s4->port() : 0),
+                (unsigned)(s.s6 ? s.s6->port() : 0), (int)s.stun.size(), s.mtu);
+    o += strfmt("transport4=%s\ntransport6=%s\n", s.s4 ? "ok" : (s.sockErr4.empty() ? "-" : s.sockErr4.c_str()),
+                s.s6 ? "ok" : (s.sockErr6.empty() ? "-" : s.sockErr6.c_str()));
+    o += strfmt("txErr4=%llu\ntxErr6=%llu\nnoRoute=%llu\n", (unsigned long long)s.txErr4, (unsigned long long)s.txErr6,
+                (unsigned long long)s.noRoute);
     std::string m;
     for (const StunServer& sv : s.stun) {
         if (!m.empty()) m += ",";
-        m += strfmt("%s:%u", ipStr(sv.mapped.ip).c_str(), (unsigned)sv.mapped.port);
+        m += addrStr(sv.mapped);
     }
     o += "mapped=" + m + "\n";
     return o;
@@ -1706,14 +1791,29 @@ std::string Engine::lastError() {
     return p_->lastErr;
 }
 
+void Engine::setSocketFactory(UdpFactory f) {
+    std::lock_guard<std::mutex> g(p_->mu);
+    p_->factory = std::move(f);
+}
+
 int Engine::socketFd() {
     std::lock_guard<std::mutex> g(p_->mu);
-    return p_->sock;
+    return p_->s4 ? p_->s4->fd() : -1;
+}
+
+int Engine::socketFd6() {
+    std::lock_guard<std::mutex> g(p_->mu);
+    return p_->s6 ? p_->s6->fd() : -1;
 }
 
 uint16_t Engine::localPort() {
     std::lock_guard<std::mutex> g(p_->mu);
-    return p_->localPort;
+    return p_->s4 ? p_->s4->port() : 0;
+}
+
+uint16_t Engine::localPort6() {
+    std::lock_guard<std::mutex> g(p_->mu);
+    return p_->s6 ? p_->s6->port() : 0;
 }
 
 }  // namespace lb

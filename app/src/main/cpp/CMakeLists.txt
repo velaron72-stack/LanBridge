@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_library(lanbridge SHARED
     jni_bridge.cpp
+    addr.cpp
     engine.cpp
     crypto.cpp
     frag.cpp
@@ -13,6 +14,7 @@ add_library(lanbridge SHARED
     offer.cpp
     protocol.cpp
     stun.cpp
+    udpio.cpp
     util.cpp)
 
 target_compile_options(lanbridge PRIVATE

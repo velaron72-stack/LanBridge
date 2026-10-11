@@ -8,12 +8,49 @@
 namespace lb {
 
 static const size_t kMaxName = 24;
-static const size_t kMaxCands = 8;
+static const size_t kMaxCands = 12;
 static const size_t kMaxV6 = 3;
+static const uint8_t kCandV6 = 0x80;  // flag in the candidate type byte: the address is IPv6 (16 bytes instead of 4)
+
+static Addr explicitAddr(const Candidate& c) { return candAddr(c); }
+
+std::vector<Candidate> offerCandidates(const Offer& o, bool unique) {
+    std::vector<Candidate> r;
+    auto has = [&](const Addr& a) {
+        for (const Candidate& c : r)
+            if (explicitAddr(c) == a) return true;
+        return false;
+    };
+    for (const Candidate& c : o.cands) {
+        Addr a = explicitAddr(c);
+        if (!addrUsablePeer(a) || (unique && has(a))) continue;
+        r.push_back(c);
+    }
+    if (o.port6 != 0) {
+        for (const Ip6& ip : o.v6) {
+            Addr a = addr6(ip, o.port6);
+            if (!addrUsablePeer(a) || has(a)) continue;
+            Candidate c{0, 0, o.port6};
+            c.v6 = true;
+            c.ip6 = ip;
+            r.push_back(c);
+        }
+    }
+    return r;
+}
+
+int offerFamilies(const Offer& o) {
+    int f = 0;
+    for (const Candidate& c : offerCandidates(o)) f |= c.v6 ? 2 : 1;
+    return f;
+}
 
 bool offerEncode(const Offer& o, std::vector<uint8_t>& out) {
     out.clear();
-    if (o.cands.empty() || o.cands.size() > kMaxCands || o.v6.size() > kMaxV6) return false;
+    if (o.cands.size() > kMaxCands || o.v6.size() > kMaxV6) return false;
+    if (offerCandidates(o).empty()) return false;
+    for (const Candidate& c : o.cands)
+        if (c.port == 0 || c.type > 1) return false;
     std::string name = o.name.substr(0, kMaxName);
     out.push_back(kOfferVersion);
     out.push_back(0);  // flags
@@ -26,15 +63,22 @@ bool offerEncode(const Offer& o, std::vector<uint8_t>& out) {
     out.insert(out.end(), name.begin(), name.end());
     out.push_back((uint8_t)o.cands.size());
     for (const Candidate& c : o.cands) {
-        out.push_back(c.type);
-        putBe32(b4, c.ip);
-        out.insert(out.end(), b4, b4 + 4);
+        out.push_back((uint8_t)(c.type | (c.v6 ? kCandV6 : 0)));
+        if (c.v6) {
+            out.insert(out.end(), c.ip6.begin(), c.ip6.end());
+        } else {
+            putBe32(b4, c.ip);
+            out.insert(out.end(), b4, b4 + 4);
+        }
         uint8_t b2[2];
         putBe16(b2, c.port);
         out.insert(out.end(), b2, b2 + 2);
     }
     out.push_back((uint8_t)o.v6.size());
     for (const Ip6& a : o.v6) out.insert(out.end(), a.begin(), a.end());
+    uint8_t b2[2];
+    putBe16(b2, o.port6);
+    out.insert(out.end(), b2, b2 + 2);
     uint8_t chk[4];
     crypto::blake2s(chk, 4, nullptr, 0, out.data(), out.size());
     out.insert(out.end(), chk, chk + 4);
@@ -44,8 +88,10 @@ bool offerEncode(const Offer& o, std::vector<uint8_t>& out) {
 int offerDecode(const uint8_t* p, size_t n, Offer& o) {
     if (n < 8) return OFFER_FORMAT;
     if (p[0] != kOfferVersion) return OFFER_VERSION;
+    // fixed part: version, flags, expiry, key, nat, name length ... candidate count, v6 count, port6, checksum
+    if (n < 2 + 4 + 32 + 1 + 1 + 1 + 1 + 2 + 4) return OFFER_FORMAT;
+    const size_t end = n - 4;  // the checksum is the last four bytes
     size_t pos = 2;
-    if (n < 6 + 32 + 2 + 1 + 4) return OFFER_FORMAT;
     Offer r;
     r.version = p[0];
     r.expiresAt = be32(p + pos);
@@ -54,32 +100,52 @@ int offerDecode(const uint8_t* p, size_t n, Offer& o) {
     pos += 32;
     r.nat = p[pos++];
     size_t nl = p[pos++];
-    if (nl > kMaxName || pos + nl + 1 > n) return OFFER_FORMAT;
+    if (nl > kMaxName || pos + nl + 1 > end) return OFFER_FORMAT;
     r.name.assign((const char*)p + pos, nl);
     pos += nl;
     size_t nc = p[pos++];
-    if (nc == 0 || nc > kMaxCands) return OFFER_FORMAT;
-    if (pos + nc * 7 + 1 + 4 > n) return OFFER_FORMAT;
+    if (nc > kMaxCands) return OFFER_FORMAT;
     for (size_t i = 0; i < nc; i++) {
-        Candidate c;
-        c.type = p[pos];
-        c.ip = be32(p + pos + 1);
-        c.port = be16(p + pos + 5);
-        pos += 7;
-        if (c.type > 1 || c.port == 0) return OFFER_FORMAT;
+        if (pos + 1 > end) return OFFER_FORMAT;
+        uint8_t tag = p[pos++];
+        bool v6 = (tag & kCandV6) != 0;
+        Candidate c{(uint8_t)(tag & 0x7F), 0, 0};
+        if (c.type > 1) return OFFER_FORMAT;
+        size_t alen = v6 ? 16 : 4;
+        if (pos + alen + 2 > end) return OFFER_FORMAT;
+        if (v6) {
+            c.v6 = true;
+            memcpy(c.ip6.data(), p + pos, 16);
+        } else {
+            c.ip = be32(p + pos);
+        }
+        pos += alen;
+        c.port = be16(p + pos);
+        pos += 2;
+        if (c.port == 0) return OFFER_FORMAT;
         r.cands.push_back(c);
     }
+    if (pos + 1 > end) return OFFER_FORMAT;
     size_t n6 = p[pos++];
-    if (n6 > kMaxV6 || pos + n6 * 16 + 4 != n) return OFFER_FORMAT;
+    if (n6 > kMaxV6 || pos + n6 * 16 + 2 != end) return OFFER_FORMAT;
     for (size_t i = 0; i < n6; i++) {
         Ip6 a;
         memcpy(a.data(), p + pos, 16);
         pos += 16;
         r.v6.push_back(a);
     }
+    r.port6 = be16(p + pos);
+    pos += 2;
     uint8_t chk[4];
     crypto::blake2s(chk, 4, nullptr, 0, p, pos);
     if (!crypto::ctEqual(chk, p + pos, 4)) return OFFER_CHECKSUM;
+    // Candidates that cannot be a destination (0.0.0.0, multicast, link-local or loopback IPv6 ...) are dropped, and
+    // a code without any usable one is of no use.
+    std::vector<Candidate> keep;
+    for (const Candidate& c : r.cands)
+        if (addrUsablePeer(candAddr(c))) keep.push_back(c);
+    r.cands = keep;
+    if (offerCandidates(r).empty()) return OFFER_NO_CANDIDATES;
     r.name = sanitize(r.name, kMaxName);
     o = r;
     return OFFER_OK;
@@ -92,9 +158,9 @@ Layout computeLayout(const Offer& mine, const Offer& peer) {
                              A(172, 30, 77, 0),  A(10, 213, 77, 0),   A(192, 168, 233, 0), A(172, 29, 213, 0)};
     std::vector<uint32_t> used;
     for (const Candidate& c : mine.cands)
-        if (c.type == 0) used.push_back(c.ip);
+        if (c.type == 0 && !c.v6) used.push_back(c.ip);
     for (const Candidate& c : peer.cands)
-        if (c.type == 0) used.push_back(c.ip);
+        if (c.type == 0 && !c.v6) used.push_back(c.ip);
     uint32_t chosen = nets[0];
     for (uint32_t n : nets) {
         bool clash = false;
@@ -129,7 +195,7 @@ Layout computeLayout(const Offer& mine, const Offer& peer) {
         uint32_t last = ip & 0xFFu;
         if (last == 0 || last == 255) return false;
         for (const Candidate& c : installer.cands) {
-            if (c.type != 0) continue;
+            if (c.type != 0 || c.v6) continue;
             if (c.ip == ip) return false;
             if ((c.ip >> 8) == (ip >> 8) && (last == 1 || last == 254)) return false;
         }
@@ -137,7 +203,7 @@ Layout computeLayout(const Offer& mine, const Offer& peer) {
     };
     auto collect = [&](const Offer& from, const Offer& installer, std::vector<uint32_t>& out) {
         for (const Candidate& c : from.cands) {
-            if (c.type != 0 || out.size() >= 4) continue;
+            if (c.type != 0 || c.v6 || out.size() >= 4) continue;
             if (!aliasOk(c.ip, installer)) continue;
             bool dup = false;
             for (uint32_t x : out) dup |= x == c.ip;

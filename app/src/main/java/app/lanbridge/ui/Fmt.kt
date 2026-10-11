@@ -33,12 +33,27 @@ object Fmt {
         else -> "не определён"
     }
 
-    /** "host:1.2.3.4:5000" -> "локальный 1.2.3.4:5000" */
+    /** "host:1.2.3.4:5000" -> "локальный 1.2.3.4:5000"; "srflx:[2001:db8::1]:5000" -> "внешний IPv6 [2001:db8::1]:5000" */
     fun cand(c: String): String {
         val i = c.indexOf(':')
         if (i < 0) return c
         val kind = c.substring(0, i)
         val rest = c.substring(i + 1)
-        return (if (kind == "host") "локальный " else "внешний ") + rest
+        val v6 = rest.startsWith("[")
+        val label = when {
+            kind == "host" && v6 -> "адрес IPv6 "
+            kind == "host" -> "локальный "
+            v6 -> "внешний IPv6 "
+            else -> "внешний "
+        }
+        return label + rest
+    }
+
+    /** Protocols a code can be reached over: bit 0 IPv4, bit 1 IPv6. */
+    fun families(f: Int): String = when (f) {
+        3 -> "IPv4 и IPv6"
+        2 -> "только IPv6"
+        1 -> "только IPv4"
+        else -> "нет адресов"
     }
 }
