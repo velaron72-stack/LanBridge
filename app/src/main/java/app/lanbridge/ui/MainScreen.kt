@@ -62,6 +62,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import app.lanbridge.core.Mode
 import app.lanbridge.core.Phase
 import app.lanbridge.core.TunnelController
 import app.lanbridge.core.UiState
@@ -80,6 +81,7 @@ fun MainScreen() {
     var sheet by remember { mutableStateOf(Sheet.NONE) }
     var showStartup by rememberSaveable { mutableStateOf(true) }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    var groupAutoStarted by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         while (true) {
@@ -94,7 +96,13 @@ fun MainScreen() {
     }
 
     val vpnLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
-        if (r.resultCode == Activity.RESULT_OK) startTunnel() else TunnelController.reportError("Разрешение на VPN не выдано")
+        if (r.resultCode == Activity.RESULT_OK) {
+            startTunnel()
+        } else {
+            TunnelController.reportError("Разрешение на VPN не выдано")
+            // a newcomer that was admitted cannot stay in limbo without a tunnel
+            if (TunnelController.ui.value.joining) TunnelController.resetAll()
+        }
     }
     val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { r ->
@@ -102,12 +110,21 @@ fun MainScreen() {
         if (c != null) TunnelController.setFriendText(c)
     }
 
-    fun onCreateCode() {
+    fun askVpn() {
+        val consent = VpnService.prepare(ctx)
+        if (consent != null) vpnLauncher.launch(consent) else startTunnel()
+    }
+
+    fun askNotifications() {
         if (Build.VERSION.SDK_INT >= 33 &&
             ctx.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
+    }
+
+    fun onCreateCode() {
+        askNotifications()
         TunnelController.createCode()
     }
 
@@ -117,17 +134,54 @@ fun MainScreen() {
             TunnelController.reportError(err)
             return
         }
-        val consent = VpnService.prepare(ctx)
-        if (consent != null) vpnLauncher.launch(consent) else startTunnel()
+        askVpn()
+    }
+
+    fun onCreateGroup() {
+        askNotifications()
+        TunnelController.createGroup()
+    }
+
+    fun onJoinGroup() {
+        askNotifications()
+        TunnelController.joinGroup()
+    }
+
+    fun onStartGroup() {
+        val err = TunnelController.prepareStartGroup()
+        if (err != null) {
+            TunnelController.reportError(err)
+            return
+        }
+        askVpn()
     }
 
     fun onScan() {
         val o = ScanOptions()
         o.setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-        o.setPrompt("Наведите камеру на QR-код друга")
+        o.setPrompt("Наведите камеру на QR-код")
         o.setBeepEnabled(false)
         o.setOrientationLocked(false)
         scanLauncher.launch(o)
+    }
+
+    // The creator of a group needs no extra tap: as soon as the code exists, the tunnel is started (the system asks
+    // for the VPN permission once). If it is declined, the "Запустить" button is still there.
+    LaunchedEffect(ui.groupRole, ui.phase, ui.myCode != null, ui.busy) {
+        if (ui.groupRole == 0) {
+            groupAutoStarted = false
+        } else if (ui.groupRole == 1 && ui.phase == Phase.READY && ui.myCode != null && !ui.busy && !groupAutoStarted) {
+            groupAutoStarted = true
+            onStartGroup()
+        }
+    }
+
+    // A newcomer is admitted and knows the network: start the VPN with the layout the core computed.
+    LaunchedEffect(ui.joinReady) {
+        if (ui.joinReady) {
+            TunnelController.consumeJoinReady()
+            askVpn()
+        }
     }
 
     Scaffold(
@@ -162,16 +216,32 @@ fun MainScreen() {
             val active = ui.phase == Phase.CONNECTING || ui.phase == Phase.CONNECTED ||
                 ui.phase == Phase.STALLED || ui.phase == Phase.FAILED
             if (active) {
-                ActiveSection(ui) { TunnelController.disconnect(ctx) }
+                ActiveSection(ui, now, onShowQr = { sheet = Sheet.QR }) { TunnelController.disconnect(ctx) }
             } else {
-                SetupSection(
-                    ui = ui,
-                    now = now,
-                    onCreate = { onCreateCode() },
-                    onShowQr = { sheet = Sheet.QR },
-                    onScan = { onScan() },
-                    onConnect = { onConnect() },
-                )
+                if (ui.myCode == null && !ui.joining) {
+                    ModeSwitch(ui.mode, enabled = !ui.busy) { TunnelController.setMode(it) }
+                }
+                if (ui.mode == Mode.GROUP) {
+                    GroupSetup(
+                        ui = ui,
+                        now = now,
+                        onCreate = { onCreateGroup() },
+                        onShowQr = { sheet = Sheet.QR },
+                        onScan = { onScan() },
+                        onJoin = { onJoinGroup() },
+                        onStart = { onStartGroup() },
+                        onClose = { TunnelController.resetAll() },
+                    )
+                } else {
+                    SetupSection(
+                        ui = ui,
+                        now = now,
+                        onCreate = { onCreateCode() },
+                        onShowQr = { sheet = Sheet.QR },
+                        onScan = { onScan() },
+                        onConnect = { onConnect() },
+                    )
+                }
             }
 
             Text(
@@ -212,7 +282,7 @@ fun MainScreen() {
 }
 
 @Composable
-private fun SectionCard(title: String, content: @Composable ColumnScope.() -> Unit) {
+internal fun SectionCard(title: String, content: @Composable ColumnScope.() -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(14.dp),
@@ -231,7 +301,7 @@ private fun SectionCard(title: String, content: @Composable ColumnScope.() -> Un
 }
 
 @Composable
-private fun ErrorBanner(msg: String) {
+internal fun ErrorBanner(msg: String) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(12.dp),
@@ -253,7 +323,7 @@ private fun ErrorBanner(msg: String) {
 }
 
 @Composable
-private fun CodeBox(code: String) {
+internal fun CodeBox(code: String) {
     Box(
         Modifier
             .fillMaxWidth()
@@ -268,7 +338,7 @@ private fun CodeBox(code: String) {
 }
 
 @Composable
-private fun Line(label: String, value: String) {
+internal fun Line(label: String, value: String) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         Text(label, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(
@@ -424,26 +494,32 @@ private fun SetupSection(
 }
 
 @Composable
-private fun ActiveSection(ui: UiState, onDisconnect: () -> Unit) {
-    StatusCard(ui)
+private fun ActiveSection(ui: UiState, now: Long, onShowQr: () -> Unit, onDisconnect: () -> Unit) {
+    val group = ui.groupRole != 0
+    if (group) GroupStatusCard(ui) else StatusCard(ui)
+    val leave = when (ui.groupRole) {
+        1 -> "Закрыть группу"
+        2 -> "Выйти"
+        else -> "Отключить"
+    }
     when (ui.phase) {
         Phase.CONNECTING -> {
-            OutlinedButton(onClick = onDisconnect, modifier = Modifier.fillMaxWidth()) { Text("Отмена") }
+            OutlinedButton(onClick = onDisconnect, modifier = Modifier.fillMaxWidth()) { Text(if (group) leave else "Отмена") }
         }
         Phase.CONNECTED, Phase.STALLED -> {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
                     onClick = { TunnelController.runLanTest() },
-                    enabled = ui.phase == Phase.CONNECTED && !ui.testing,
+                    enabled = ui.phase == Phase.CONNECTED && !ui.testing && (!group || ui.layout?.peer?.isNotEmpty() == true),
                     modifier = Modifier.weight(1f),
                 ) { Text(if (ui.testing) "Проверяю…" else "Проверка LAN") }
-                OutlinedButton(onClick = onDisconnect, modifier = Modifier.weight(1f)) { Text("Отключить") }
+                OutlinedButton(onClick = onDisconnect, modifier = Modifier.weight(1f)) { Text(leave) }
             }
         }
         Phase.FAILED -> {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = { TunnelController.retry() }, modifier = Modifier.weight(1f)) { Text("Повторить") }
-                OutlinedButton(onClick = onDisconnect, modifier = Modifier.weight(1f)) { Text("Отключить") }
+                OutlinedButton(onClick = onDisconnect, modifier = Modifier.weight(1f)) { Text(leave) }
             }
         }
         else -> {}
@@ -455,6 +531,10 @@ private fun ActiveSection(ui: UiState, onDisconnect: () -> Unit) {
                 Text(r.substringAfter('\n', r), fontFamily = FontFamily.Monospace, fontSize = 12.sp, lineHeight = 17.sp)
             }
         }
+    }
+    if (group) {
+        MembersCard(ui, "Участники")
+        if (ui.groupRole == 1 && ui.myCode != null) GroupCodeCard(ui, now, onShowQr)
     }
 }
 
@@ -476,8 +556,17 @@ private fun StatusCard(ui: UiState) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(title, style = MaterialTheme.typography.headlineSmall, color = color, fontWeight = FontWeight.SemiBold)
             if (ui.phase == Phase.CONNECTING) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-            val name = ui.friend?.name?.ifBlank { null }
-            if (name != null) Line("Друг", name)
+            val fm = ui.members.firstOrNull()
+            val name = fm?.name?.ifBlank { null } ?: ui.friend?.name?.ifBlank { null }
+            if (name != null || fm != null) {
+                PersonRow(
+                    name = name ?: "Друг",
+                    avatar = if (fm != null) ui.avatars[fm.slot] else null,
+                    line = "друг",
+                    extra = "",
+                    dot = color,
+                )
+            }
             val l = ui.layout
             if (l != null) {
                 Line("Ваш адрес", l.my)

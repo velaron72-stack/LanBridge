@@ -222,7 +222,7 @@ object LanSelfTest {
         val probes = ArrayList<Probe>()
         probes += Probe("u", "Unicast ${layout.peer}", layout.peer, 0, true)
         val real = layout.aliasRoutes.firstOrNull()
-        if (real != null) probes += Probe("r", "Unicast $real (реальный адрес друга)", real, 0, true)
+        if (real != null) probes += Probe("r", "Unicast $real (реальный адрес участника)", real, 0, true)
         probes += Probe("b1", "Broadcast 255.255.255.255", "255.255.255.255", 0)
         probes += Probe("b2", "Broadcast ${layout.bcast}", layout.bcast, 0)
         probes += Probe("m", "Multicast $MCAST", MCAST, 0)
@@ -231,7 +231,7 @@ object LanSelfTest {
         val real6 = layout.aliasRoutes6.firstOrNull()
         if (layout.peer6.isNotEmpty()) {
             probes += Probe("u6", "IPv6 unicast ${layout.peer6}", layout.peer6, 0, true)
-            if (real6 != null) probes += Probe("r6", "IPv6 unicast $real6 (реальный адрес друга)", real6, 0, true)
+            if (real6 != null) probes += Probe("r6", "IPv6 unicast $real6 (реальный адрес участника)", real6, 0, true)
             probes += Probe("c6", "IPv6 UDP $MID Б (туннель режет сам)", layout.peer6, MID, true)
             probes += Probe("f6", "IPv6 UDP $BIG Б (фрагментация)", layout.peer6, BIG, true)
         }
@@ -323,7 +323,7 @@ object LanSelfTest {
             sb.append("\nIPv6 TCP 256 КБ → ${layout.peer6} — ").append(tcpProbe(layout.peer6))
             if (real6 != null) sb.append("\nIPv6 TCP 256 КБ → $real6 — ").append(tcpProbe(real6))
         }
-        if (ok.isEmpty()) sb.append("\nУбедитесь, что у друга тоже открыто соединение (статус «Подключено»).")
+        if (ok.isEmpty()) sb.append("\nУбедитесь, что у другого участника тоже открыто соединение (статус «Подключено»).")
         return sb.toString()
     }
 }

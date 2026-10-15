@@ -2,14 +2,32 @@ package app.lanbridge.core
 
 import android.content.Context
 import android.os.Build
+import android.util.Base64
 
 class Prefs(context: Context) {
     private val sp = context.applicationContext.getSharedPreferences("lanbridge", Context.MODE_PRIVATE)
 
+    /** The name the other participants see. */
     var deviceName: String
         get() = sp.getString("name", null)?.takeIf { it.isNotBlank() } ?: (Build.MODEL ?: "Android")
         set(v) {
             sp.edit().putString("name", v.trim()).apply()
+        }
+
+    /** The avatar the other participants see: a small JPEG (at most [AVATAR_MAX] bytes), empty when there is none. */
+    var avatar: ByteArray
+        get() {
+            val s = sp.getString("avatar", null) ?: return ByteArray(0)
+            return try {
+                Base64.decode(s, Base64.NO_WRAP)
+            } catch (_: IllegalArgumentException) {
+                ByteArray(0)
+            }
+        }
+        set(v) {
+            val e = sp.edit()
+            if (v.isEmpty() || v.size > AVATAR_MAX) e.remove("avatar") else e.putString("avatar", Base64.encodeToString(v, Base64.NO_WRAP))
+            e.apply()
         }
 
     var stunServers: String
@@ -40,8 +58,27 @@ class Prefs(context: Context) {
             sp.edit().putBoolean("awake", v).apply()
         }
 
+    /** Group mode (true) or direct connection of two devices (false) is shown on the main screen. */
+    var groupMode: Boolean
+        get() = sp.getBoolean("groupMode", true)
+        set(v) {
+            sp.edit().putBoolean("groupMode", v).apply()
+        }
+
+    /**
+     * Strict NAT help: a joining device leaves a small encrypted note on a public message board (ntfy.sh) and the
+     * group's creator reads it. Only needed when the creator sits behind a NAT that drops the newcomer's first packets;
+     * the note is sealed with a key derived from the group code and holds nothing but the newcomer's network addresses.
+     */
+    var hintMailbox: Boolean
+        get() = sp.getBoolean("hintMailbox", true)
+        set(v) {
+            sp.edit().putBoolean("hintMailbox", v).apply()
+        }
+
     companion object {
         const val DEFAULT_MTU = 1500
+        const val AVATAR_MAX = 12288
         const val DEFAULT_STUN = "stun.l.google.com:19302\n" +
             "stun1.l.google.com:19302\n" +
             "stun.cloudflare.com:3478\n" +

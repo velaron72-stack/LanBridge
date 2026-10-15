@@ -1,5 +1,6 @@
 package app.lanbridge.ui
 
+import app.lanbridge.core.Member
 import java.util.Locale
 
 object Fmt {
@@ -47,6 +48,36 @@ object Fmt {
             else -> "внешний "
         }
         return label + rest
+    }
+
+    /** A member of the network as the list shows it: the name, or "Участник N" while the profile has not arrived yet. */
+    fun memberName(m: Member): String = m.name.ifBlank { "Участник ${m.slot}" }
+
+    fun memberState(state: Int): String = when (state) {
+        1 -> "соединяется"
+        2 -> "в сети"
+        3 -> "не отвечает"
+        4 -> "вышел"
+        else -> "—"
+    }
+
+    /** How the packets of a member travel: 0 none, 1 internet, 2 local network, 3 through the creator. */
+    fun memberPath(kind: Int): String = when (kind) {
+        1 -> "напрямую через интернет"
+        2 -> "напрямую, локальная сеть"
+        3 -> "через создателя группы"
+        else -> ""
+    }
+
+    /** "в сети · 23 мс · напрямую через интернет", the second line of a member row. */
+    fun memberLine(m: Member): String {
+        val parts = ArrayList<String>()
+        parts.add(memberState(m.state))
+        if (m.state == 2 && m.rttMs >= 0) parts.add("${m.rttMs} мс")
+        val p = memberPath(m.pathKind)
+        if (m.state == 2 && p.isNotEmpty()) parts.add(p)
+        if (m.state == 2 && m.pathText.isNotEmpty() && m.pathKind != 3) parts.add(if (m.pathText.startsWith("[")) "IPv6" else "IPv4")
+        return parts.joinToString(" · ")
     }
 
     /** Protocols a code can be reached over: bit 0 IPv4, bit 1 IPv6. */

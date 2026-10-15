@@ -12,8 +12,10 @@
 namespace lb {
 
 // 3: adds IPv6 addresses (for the tunnel inside); 4: the tunnel itself runs over IPv6 as well (IPv6 candidates and
-// the IPv6 port). Codes of other versions are rejected.
+// the IPv6 port); 5: a group code (version 4 plus the group secret, see Offer::group). Codes of other versions are
+// rejected. Direct (two-device) codes keep version 4, so they stay compatible with build 20004.
 constexpr uint8_t kOfferVersion = 4;
+constexpr uint8_t kOfferVersionGroup = 5;
 
 struct Candidate {
     uint8_t type;   // 0 = host (local interface address), 1 = server reflexive (public address from STUN)
@@ -34,6 +36,14 @@ struct Offer {
     // Port of the device's IPv6 socket (0: no IPv6 socket). Every address of `v6` together with this port is an
     // implicit IPv6 host candidate, so these addresses do not have to be written twice into the code.
     uint16_t port6 = 0;
+
+    // Group code: the code of the group's creator that any device can use to join. It carries a random secret (from
+    // which everybody derives the key that lets a newcomer knock at the creator's door), the group's network
+    // 192.168.<gthird>.0/24 and the size limit. Whoever knows the code can join until it expires.
+    bool group = false;
+    uint8_t gsecret[32] = {0};
+    uint8_t gthird = 0;
+    uint8_t gmax = 0;
 };
 
 enum OfferError {
@@ -45,7 +55,9 @@ enum OfferError {
     OFFER_VERSION = 5,
     OFFER_NOT_READY = 6,
     OFFER_NO_CANDIDATES = 7,
-    OFFER_OWN_EXPIRED = 8
+    OFFER_OWN_EXPIRED = 8,
+    OFFER_NOT_GROUP = 9,     // a group operation with a direct code, or the other way round
+    OFFER_GROUP_BUSY = 10    // the engine is not in a state to join a group
 };
 
 bool offerEncode(const Offer& o, std::vector<uint8_t>& out);
@@ -77,5 +89,12 @@ struct Layout {
     std::vector<Ip6> aliasMine6;
 };
 Layout computeLayout(const Offer& mine, const Offer& peer);
+
+// Whether a real address of another device can be mirrored into the virtual network `net` on the device described by
+// `installer` (the one that adds the route). The rules of computeLayout: not 0/127/multicast/link-local, outside the
+// virtual network, not an own address of the installer, and in a network shared with the installer not a gateway- or
+// broadcast-looking host (.0 .1 .254 .255). IPv6 analogue for global/unique-local addresses.
+bool aliasUsable4(uint32_t ip, const Offer& installer, uint32_t net);
+bool aliasUsable6(const Ip6& a, const Offer& installer, const Ip6& net6);
 
 }  // namespace lb

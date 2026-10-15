@@ -42,7 +42,8 @@ static void mac16(uint8_t out[16], const uint8_t key[32], const uint8_t* data, s
     blake2s(out, 16, key, 32, data, n);
 }
 
-bool hsCreateInitiation(HsInit& st, const KeyPair& me, const uint8_t Sr[32], uint64_t ts, uint32_t localIdx) {
+bool hsCreateInitiation(HsInit& st, const KeyPair& me, const uint8_t Sr[32], uint64_t ts, uint32_t localIdx,
+                        const uint8_t* ssCached) {
     uint8_t C[32], H[32], e[32], E[32], dh[32], k[32];
     initialState(C, H, me.pub, Sr);
     genKeypair(e, E);
@@ -50,7 +51,11 @@ bool hsCreateInitiation(HsInit& st, const KeyPair& me, const uint8_t Sr[32], uin
     hash2(H, H, 32, E, 32);
     if (!x25519(dh, e, Sr)) return false;  // es
     kdf2(C, k, C, dh, 32);
-    if (!x25519(dh, me.priv, Sr)) return false;  // ss
+    if (ssCached) {
+        memcpy(dh, ssCached, 32);  // ss: constant for the pair of static keys
+    } else if (!x25519(dh, me.priv, Sr)) {
+        return false;  // ss
+    }
     kdf2(C, k, C, dh, 32);
     uint8_t tsb[12];
     memset(tsb, 0, sizeof tsb);
@@ -81,21 +86,36 @@ bool hsCreateInitiation(HsInit& st, const KeyPair& me, const uint8_t Sr[32], uin
     return true;
 }
 
-bool hsConsumeInitiation(const uint8_t* msg, size_t n, const KeyPair& me, const uint8_t Si[32], HsRespIn& out) {
+// The first half of consuming a MSG1 is the same for every candidate initiator: the length, the MAC (keyed by our
+// own public key) and the ephemeral-static DH. It is done once per datagram.
+bool hsMsg1Shared(const uint8_t* msg, size_t n, const KeyPair& me, uint8_t es[32]) {
     if (n != MSG1_LEN || msg[0] != T_MSG1) return false;
     uint8_t mk[32], mac[16];
     macKey(mk, me.pub);
     mac16(mac, mk, msg, 65);
     if (!ctEqual(mac, msg + 65, 16)) return false;
+    return x25519(es, me.priv, msg + 5);
+}
 
+bool hsConsumeInitiation(const uint8_t* msg, size_t n, const KeyPair& me, const uint8_t Si[32], HsRespIn& out,
+                         const uint8_t* esShared, const uint8_t* ssCached) {
+    if (n != MSG1_LEN || msg[0] != T_MSG1) return false;
+    uint8_t es[32];
+    if (!esShared) {
+        if (!hsMsg1Shared(msg, n, me, es)) return false;
+        esShared = es;
+    }
     uint8_t C[32], H[32], dh[32], k[32];
     const uint8_t* E = msg + 5;
     initialState(C, H, Si, me.pub);
     kdf1(C, C, E, 32);
     hash2(H, H, 32, E, 32);
-    if (!x25519(dh, me.priv, E)) return false;  // es
-    kdf2(C, k, C, dh, 32);
-    if (!x25519(dh, me.priv, Si)) return false;  // ss
+    kdf2(C, k, C, esShared, 32);  // es
+    if (ssCached) {
+        memcpy(dh, ssCached, 32);
+    } else if (!x25519(dh, me.priv, Si)) {
+        return false;  // ss
+    }
     kdf2(C, k, C, dh, 32);
     uint8_t tsb[12];
     if (!aeadDecrypt(tsb, k, 0, H, 32, msg + 37, 28)) return false;
@@ -109,6 +129,7 @@ bool hsConsumeInitiation(const uint8_t* msg, size_t n, const KeyPair& me, const 
     wipe(k, 32);
     wipe(dh, 32);
     wipe(C, 32);
+    wipe(es, 32);
     return true;
 }
 

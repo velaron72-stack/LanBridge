@@ -357,7 +357,7 @@ def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "all"
     if os.geteuid() != 0 or not os.path.exists("/dev/net/tun"):
         print("nettest skipped: needs root and /dev/net/tun"); return
-    sources = [os.path.join(SRC, f) for f in ("util.cpp", "crypto.cpp", "offer.cpp", "stun.cpp", "protocol.cpp", "ipv6.cpp", "frag.cpp", "engine.cpp", "addr.cpp", "udpio.cpp")]
+    sources = [os.path.join(SRC, f) for f in ("util.cpp", "crypto.cpp", "offer.cpp", "stun.cpp", "protocol.cpp", "ipv6.cpp", "frag.cpp", "engine.cpp", "engine_group.cpp", "engine_net.cpp", "engine_tun.cpp", "group.cpp", "addr.cpp", "udpio.cpp")]
     r = subprocess.run(["g++", "-std=c++17", "-O1", "-g", "-Wall", "-Wextra", "-fsanitize=address,undefined", "-fno-sanitize-recover=undefined",
                         "-pthread", "-I" + SRC, os.path.join(HERE, "nettest.cpp")] + sources + ["-o", BIN], capture_output=True, text=True)
     if r.returncode != 0:

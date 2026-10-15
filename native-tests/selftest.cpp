@@ -1711,8 +1711,16 @@ static void testApiMisuse() {
 }
 
 #include "transport_tests.h"
+#include "group_tests.h"
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && !strcmp(argv[1], "groups")) {  // only the group tests (quicker while working on them); optional: one scenario
+        if (argc > 2) g_onlyGroupTest = argv[2];
+        testGroups();
+        printf("\nresult: %d checks passed, %d failed\n", g_pass, g_fail);
+        if (g_fail) printf("--- engine log ---\n%s\n", logDump().c_str());
+        return g_fail ? 1 : 0;
+    }
     testCrypto();
     testProtocol();
     testIpv6Helpers();
@@ -1729,6 +1737,7 @@ int main() {
     testTransport();
     testConnectTimeout();
     testRekey();
+    testGroups();
     printf("\nresult: %d checks passed, %d failed\n", g_pass, g_fail);
     if (g_fail) {
         printf("--- engine log ---\n%s\n", logDump().c_str());

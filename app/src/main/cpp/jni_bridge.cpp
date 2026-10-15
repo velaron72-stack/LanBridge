@@ -78,24 +78,105 @@ JNIEXPORT jint JNICALL Java_app_lanbridge_core_Native_setPeer(JNIEnv* env, jobje
     }
 }
 
-JNIEXPORT jbyteArray JNICALL Java_app_lanbridge_core_Native_layout(JNIEnv* env, jobject) {
+JNIEXPORT jbyteArray JNICALL Java_app_lanbridge_core_Native_netLayout(JNIEnv* env, jobject) {
     try {
-        lb::Layout l;
-        if (!engine().layout(l)) return nullptr;
-        std::string mine, peer;
-        for (uint32_t x : l.aliasMine) mine += (mine.empty() ? "" : ",") + lb::ipStr(x);
-        for (uint32_t x : l.aliasPeer) peer += (peer.empty() ? "" : ",") + lb::ipStr(x);
-        std::string mine6, peer6;
-        for (const lb::Ip6& x : l.aliasMine6) mine6 += (mine6.empty() ? "" : ",") + lb::ip6Str(x);
-        for (const lb::Ip6& x : l.aliasPeer6) peer6 += (peer6.empty() ? "" : ",") + lb::ip6Str(x);
-        std::string t = lb::strfmt("my=%s\npeer=%s\nnet=%s\nprefix=%d\nbcast=%s\ninitiator=%d\nrealMine=%s\nrealPeer=%s\n",
-                                   lb::ipStr(l.myIp).c_str(), lb::ipStr(l.peerIp).c_str(), lb::ipStr(l.net).c_str(), l.prefix,
-                                   lb::ipStr(l.bcast).c_str(), l.initiator ? 1 : 0, mine.c_str(), peer.c_str());
-        t += lb::strfmt("my6=%s\npeer6=%s\nnet6=%s\nprefix6=%d\nrealMine6=%s\nrealPeer6=%s\n", lb::ip6Str(l.myIp6).c_str(),
-                        lb::ip6Str(l.peerIp6).c_str(), lb::ip6Str(l.net6).c_str(), l.prefix6, mine6.c_str(), peer6.c_str());
+        std::string t = engine().netLayout();
+        if (t.empty()) return nullptr;
         return fromStr(env, t);
     } catch (...) {
         return nullptr;
+    }
+}
+
+JNIEXPORT jbyteArray JNICALL Java_app_lanbridge_core_Native_prepareGroup(JNIEnv* env, jobject, jbyteArray stun,
+                                                                        jbyteArray localIps, jbyteArray name, jint ttlSec) {
+    try {
+        std::vector<uint8_t> code;
+        int rc = engine().prepareGroup(lb::splitList(toStr(env, stun)), lb::splitList(toStr(env, localIps)),
+                                       toStr(env, name), (int)ttlSec, code);
+        if (rc != 0) return nullptr;
+        return fromBytes(env, code.data(), code.size());
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+JNIEXPORT jbyteArray JNICALL Java_app_lanbridge_core_Native_renewGroup(JNIEnv* env, jobject, jint ttlSec) {
+    try {
+        std::vector<uint8_t> code;
+        if (engine().renewGroup((int)ttlSec, code) != 0) return nullptr;
+        return fromBytes(env, code.data(), code.size());
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+JNIEXPORT jint JNICALL Java_app_lanbridge_core_Native_joinGroup(JNIEnv* env, jobject, jbyteArray blob) {
+    try {
+        return (jint)engine().joinGroup(toVec(env, blob));
+    } catch (...) {
+        return -1;
+    }
+}
+
+JNIEXPORT jint JNICALL Java_app_lanbridge_core_Native_swapTun(JNIEnv*, jobject, jint fd) {
+    try {
+        return (jint)engine().swapTun((int)fd);
+    } catch (...) {
+        return -1;
+    }
+}
+
+JNIEXPORT jboolean JNICALL Java_app_lanbridge_core_Native_setProfile(JNIEnv* env, jobject, jbyteArray name,
+                                                                    jbyteArray avatar) {
+    try {
+        return engine().setProfile(toStr(env, name), toVec(env, avatar)) ? JNI_TRUE : JNI_FALSE;
+    } catch (...) {
+        return JNI_FALSE;
+    }
+}
+
+JNIEXPORT jbyteArray JNICALL Java_app_lanbridge_core_Native_members(JNIEnv* env, jobject) {
+    try {
+        return fromStr(env, engine().members());
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+JNIEXPORT jbyteArray JNICALL Java_app_lanbridge_core_Native_memberAvatar(JNIEnv* env, jobject, jint slot) {
+    try {
+        std::vector<uint8_t> a;
+        if (!engine().memberAvatar((int)slot, a)) return nullptr;
+        return fromBytes(env, a.data(), a.size());
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+JNIEXPORT jbyteArray JNICALL Java_app_lanbridge_core_Native_hintTopic(JNIEnv* env, jobject) {
+    try {
+        return fromStr(env, engine().hintTopic());
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+JNIEXPORT jbyteArray JNICALL Java_app_lanbridge_core_Native_sealHint(JNIEnv* env, jobject) {
+    try {
+        std::vector<uint8_t> n;
+        if (!engine().sealHint(n)) return nullptr;
+        return fromBytes(env, n.data(), n.size());
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+JNIEXPORT jint JNICALL Java_app_lanbridge_core_Native_openHint(JNIEnv* env, jobject, jbyteArray note) {
+    try {
+        return (jint)engine().openHint(toVec(env, note));
+    } catch (...) {
+        return -1;
     }
 }
 

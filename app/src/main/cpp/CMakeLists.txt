@@ -8,6 +8,10 @@ add_library(lanbridge SHARED
     jni_bridge.cpp
     addr.cpp
     engine.cpp
+    engine_group.cpp
+    engine_net.cpp
+    engine_tun.cpp
+    group.cpp
     crypto.cpp
     frag.cpp
     ipv6.cpp

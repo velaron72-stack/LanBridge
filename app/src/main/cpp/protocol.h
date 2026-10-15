@@ -27,7 +27,22 @@ constexpr size_t FRAG_HDR = 5;  // kind | id[2] | index | count
 constexpr int FRAG_MAX = 8;
 
 // Inner frame kinds (first plaintext byte; empty plaintext = keepalive)
-enum : uint8_t { K_IP = 1, K_CTRL = 2, K_BYE = 3, K_FRAG = 4 };
+enum : uint8_t {
+    K_IP = 1,
+    K_CTRL = 2,
+    K_BYE = 3,
+    K_FRAG = 4,
+    // groups (see group.h)
+    K_JOIN = 5,         // guest -> creator: "let me in" (the guest's own code)
+    K_WELCOME = 6,      // creator -> guest: slot in the group
+    K_REJECT = 7,       // creator -> guest: refused (reason)
+    K_MEMBER = 8,       // creator -> member: one entry of the member list
+    K_MEMBER_ACK = 9,   // member -> creator
+    K_RELAY = 10,       // a datagram for another member, forwarded by the creator (end-to-end encrypted)
+    K_PROFILE = 11,     // name and avatar size of a member
+    K_AVATAR = 12,      // a chunk of the avatar
+    K_PROFILE_ACK = 13  // receipt of profile data (what has arrived)
+};
 enum : uint8_t { C_PING = 1, C_PONG = 2 };
 
 struct KeyPair {
@@ -61,11 +76,17 @@ struct TransportKeys {
 };
 
 // Initiator: me = initiator static key pair, Sr = responder static public key.
-bool hsCreateInitiation(HsInit& st, const KeyPair& me, const uint8_t Sr[32], uint64_t ts, uint32_t localIdx);
+// ssCached: the static-static DH of (me, Sr) when the caller has it (it never changes for a pair of keys).
+bool hsCreateInitiation(HsInit& st, const KeyPair& me, const uint8_t Sr[32], uint64_t ts, uint32_t localIdx,
+                        const uint8_t* ssCached = nullptr);
 bool hsConsumeResponse(HsInit& st, const uint8_t* msg, size_t n, const KeyPair& me, const uint8_t psk[32],
                        uint32_t& remoteIdx, TransportKeys& keys);
 // Responder: me = responder static key pair, Si = initiator static public key.
-bool hsConsumeInitiation(const uint8_t* msg, size_t n, const KeyPair& me, const uint8_t Si[32], HsRespIn& out);
+// hsMsg1Shared: length, MAC and the ephemeral-static DH, the same for every candidate initiator of one datagram.
+bool hsMsg1Shared(const uint8_t* msg, size_t n, const KeyPair& me, uint8_t es[32]);
+// esShared / ssCached: results of hsMsg1Shared and of the static-static DH (me, Si); computed here when null.
+bool hsConsumeInitiation(const uint8_t* msg, size_t n, const KeyPair& me, const uint8_t Si[32], HsRespIn& out,
+                         const uint8_t* esShared = nullptr, const uint8_t* ssCached = nullptr);
 bool hsCreateResponse(const HsRespIn& in, const KeyPair& me, const uint8_t Si[32], const uint8_t psk[32],
                       uint32_t localIdx, uint8_t* msg2, TransportKeys& keys);
 

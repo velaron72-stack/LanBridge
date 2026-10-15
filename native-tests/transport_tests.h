@@ -360,10 +360,12 @@ static void testOfferV4() {
     // versions, damage, truncation
     {
         std::vector<uint8_t> o = blob;
-        for (uint8_t v : {0, 1, 2, 3, 5, 9, 255}) {
+        for (uint8_t v : {0, 1, 2, 3, 6, 9, 255}) {
             o[0] = v;
             CHECK(offerDecode(o.data(), o.size(), d) == OFFER_VERSION);
         }
+        o[0] = 5;  // a group code without the group fields is not a code
+        CHECK(offerDecode(o.data(), o.size(), d) != OFFER_OK);
         o = blob;
         o[blob.size() / 2] ^= 0x10;
         int rc = offerDecode(o.data(), o.size(), d);

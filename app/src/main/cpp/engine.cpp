@@ -1,36 +1,18 @@
-#include "engine.h"
-
-#include <arpa/inet.h>
+// LanBridge native core: engine, lifecycle, main loop and the public API. The work itself is in engine_net.cpp (sessions,
+// handshakes, datagrams), engine_group.cpp (peers, groups, relay, profiles) and engine_tun.cpp (TUN side, flows).
 #include <errno.h>
 #include <fcntl.h>
-#include <netinet/in.h>
 #include <poll.h>
-#include <sys/socket.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
-#include <deque>
-#include <unordered_map>
 #include <cstring>
-#include <mutex>
-#include <thread>
 
-#include "addr.h"
-#include "crypto.h"
-#include "frag.h"
-#include "ipv6.h"
-#include "protocol.h"
-#include "stun.h"
-#include "udpio.h"
-#include "util.h"
+#include "engine_impl.h"
 
 namespace lb {
 
-namespace {
-
-const int kMaxSessions = 4;
+using Impl = Engine::Impl;
 
 bool offerExpired(const Offer& o) { return wallMs() / 1000 > (uint64_t)o.expiresAt + 120; }
 
@@ -47,1277 +29,299 @@ const char* stateName(int s) {
     return "?";
 }
 
-}  // namespace
+// ============================================================ lifecycle helpers
 
-struct Engine::Impl {
-    Config cfg;
-    std::mutex mu;      // protects every field below
-    std::mutex lifeMu;  // serialises prepare()/stop()
-    std::atomic<int> state{ST_IDLE};
-    std::string lastErr;
+void Impl::setState(int s) {
+    int old = state.exchange(s);
+    if (old != s) LBLOG("состояние: %s -> %s", stateName(old), stateName(s));
+}
 
-    // The tunnel's own transport: one UDP socket per address family (either may be missing, e.g. a host without
-    // IPv6). Both are protected from the VPN by the caller and polled by the engine thread.
-    UdpFactory factory;
-    std::unique_ptr<UdpSocket> s4, s6;
-    std::string sockErr4, sockErr6;
-    uint64_t txErr4 = 0, txErr6 = 0, noRoute = 0;
-    int lastTxErrno[2] = {0, 0};  // per family: the last send error that was logged
-    int wakeFd[2] = {-1, -1};
-    std::thread th;
-    std::atomic<bool> running{false};
-
-    // identity (one per code)
-    bool haveIdentity = false;
-    KeyPair kp;
-    Offer myOffer;
-    int myNat = 0;
-    std::vector<StunServer> stun;
-    bool mappingChanged = false;
-    uint64_t nextStunMs = 0;
-    struct StunPend {
-        uint8_t txid[12];
-        size_t srv;
-        uint64_t sentMs;
-    };
-    std::vector<StunPend> stunPend;
-
-    // peer
-    bool havePeer = false;
-    Offer peer;
-    Layout lay;
-    bool initiator = false;
-    uint8_t sid[8];
-    uint8_t psk[32];  // always zero: peers authenticate each other with the keys from the exchanged codes
-
-    // runtime
-    int tunFd = -1;
-    int mtu = 1280;
-    uint64_t connectStartMs = 0, connectedSinceMs = 0;
-    uint64_t nextTickMs = 0, nextProbeMs = 0, nextPingMs = 0, nextRekeyMs = 0;
-    uint64_t lastTxMs = 0, lastRxMs = 0;
-    uint64_t lastTsSent = 0, lastInitTs = 0;
-    Session sess[kMaxSessions];
-    HsInit pend;
-    bool haveLast = false;
-    uint8_t lastMsg1[MSG1_LEN];
-    uint8_t lastMsg2[MSG2_LEN];
-    Addr peerAddr;
-    std::vector<Addr> peerCands;  // every address the friend can be tried at (both families), from the code
-    bool peerAddrValid = false;
-    uint64_t peerAddrMs = 0;
-    bool peerLeft = false;
-    std::vector<Addr> punchSeen;
-    uint64_t lastAuthLogMs = 0;
-
-    // statistics
-    uint64_t rxBytes = 0, txBytes = 0, rxPkts = 0, txPkts = 0;
-    uint64_t bcastTx = 0, bcastRx = 0, mcastTx = 0, mcastRx = 0;
-    uint64_t authFail = 0, punchRx = 0, hsRx = 0, dropped = 0, handshakes = 0;
-    int64_t rttMs = -1;
-
-    // diagnostics
-    uint64_t dropForeignDst = 0, dropNoSession = 0, dropBadHdr = 0, dropRxSrc = 0, dropRxDst = 0, tunWriteErr = 0;
-    uint64_t udpQueued = 0, udpDropped = 0;
-    // Big inner packets are cut into chunks by the tunnel (see K_FRAG) and put together again on the other side.
-    FragReassembler reasm;
-    uint16_t fragSeq = 0;
-    uint64_t fragSent = 0, fragRecv = 0, dropTooBig = 0, mssClamped = 0;
-    uint64_t v6Tx = 0, v6Rx = 0;
-    // Flows are aggregated by (direction, protocol, addresses, service port) so that many short-lived connections of
-    // one service share one entry. T: forwarded to the peer, R: delivered to the TUN, X/Y: dropped (TUN / peer side).
-    struct Flow {
-        char dir;
-        uint8_t proto;
-        bool v6;
-        uint32_t sip, dip;  // IPv4 addresses (host order); for IPv6 flows s6/d6 are used instead
-        Ip6 s6, d6;
-        uint16_t svc;  // TCP/UDP: the lower port of the pair; ICMP/ICMPv6: the type
-        uint64_t pkts, bytes;
-        uint16_t maxLen;
-        uint32_t syn, synack, rst, fin, frags;
-        uint64_t firstMs, lastMs;  // relative to flowEpochMs
-    };
-    struct PktRec {
-        uint32_t tMs;
-        char dir;
-        uint8_t proto, tcpFlags, ipFlags;
-        bool v6;
-        uint32_t sip, dip;
-        Ip6 s6, d6;
-        uint16_t sport, dport, len;
-    };
-    std::vector<Flow> flowTab;
-    uint64_t flowOverflow = 0;
-    uint64_t selftestPkts = 0;  // the app's own "Проверка LAN" traffic (port 41377) is counted but not listed
-    uint64_t flowEpochMs = 0;
-    std::vector<PktRec> headRing;  // the first packets after a reset
-    PktRec tailRing[96];           // the most recent packets
-    size_t tailCount = 0;
-
-    // UDP source fixup (what IP_PKTINFO would give a server): the system picks the first address of the TUN as the
-    // source of everything that leaves through it, but a reply must come from the very address the peer used. So the
-    // engine remembers, per (local port, peer address, peer port), which of our addresses a datagram was sent to and
-    // puts that address on the replies.
-    struct UdpAssoc {
-        uint32_t local;
-        uint64_t lastMs;
-    };
-    std::unordered_map<uint64_t, UdpAssoc> udpAssoc;
-    struct FragFix {
-        uint32_t src, dst, newSrc;
-        uint16_t id;
-        uint64_t expMs;
-    };
-    std::vector<FragFix> fragFix;
-    uint64_t lastAssocGcMs = 0;
-    uint64_t udpFixups = 0;
-
-    // outgoing datagrams that did not fit into the socket buffer yet
-    struct OutPkt {
-        Addr to;
-        uint16_t len;
-        uint8_t data[2048];
-    };
-    std::deque<OutPkt> outq;
-
-    Impl() {
-        memset(&kp, 0, sizeof kp);
-        memset(sid, 0, sizeof sid);
-        memset(psk, 0, sizeof psk);
-        memset(lastMsg1, 0, sizeof lastMsg1);
-        memset(lastMsg2, 0, sizeof lastMsg2);
+void Impl::wake() {
+    if (wakeFd[1] >= 0) {
+        uint8_t b = 1;
+        ssize_t r = write(wakeFd[1], &b, 1);
+        (void)r;
     }
+}
 
-    // ------------------------------------------------------------ helpers
-    void setState(int s) {
-        int old = state.exchange(s);
-        if (old != s) LBLOG("состояние: %s -> %s", stateName(old), stateName(s));
+void Impl::drainWake() {
+    uint8_t b[64];
+    while (read(wakeFd[0], b, sizeof b) > 0) {
     }
+}
 
-    void wake() {
-        if (wakeFd[1] >= 0) {
-            uint8_t b = 1;
-            ssize_t r = write(wakeFd[1], &b, 1);
-            (void)r;
-        }
-    }
-
-    void drainWake() {
-        uint8_t b[64];
-        while (read(wakeFd[0], b, sizeof b) > 0) {
-        }
-    }
-
-    UdpSocket* sockFor(const Addr& a) { return a.v6 ? s6.get() : s4.get(); }
-    bool haveSocket() const { return s4 || s6; }
-
-    // Opens the missing sockets. IPv4 and IPv6 are independent: the tunnel works with one of them, and a failure of
-    // the other family is only logged (a device or a network without IPv6 is normal).
-    bool openSocketLocked() {
-        for (int fam = 0; fam < 2; fam++) {
-            std::unique_ptr<UdpSocket>& slot = fam ? s6 : s4;
-            std::string& why = fam ? sockErr6 : sockErr4;
-            if (slot) continue;
-            std::string err;
-            slot = factory ? factory(fam == 1, err) : openSysUdp(fam == 1, err);
-            if (slot && slot->v6() != (fam == 1)) slot.reset();  // a factory that returned the wrong family
-            if (!slot) {
-                why = err.empty() ? "сокет не создан" : err;
-                LBLOG("транспорт %s недоступен: %s", fam ? "IPv6" : "IPv4", why.c_str());
-            } else {
-                why.clear();
-                LBLOG("транспорт %s: порт %u", fam ? "IPv6" : "IPv4", (unsigned)slot->port());
-            }
-        }
-        if (!haveSocket()) {
-            lastErr = sockErr4.empty() ? sockErr6 : (sockErr6.empty() ? sockErr4 : sockErr4 + "; " + sockErr6);
-            return false;
-        }
-        if (wakeFd[0] < 0) {
-            if (pipe(wakeFd) < 0) {
-                lastErr = strfmt("pipe: %s", strerror(errno));
-                wakeFd[0] = wakeFd[1] = -1;
-                s4.reset();
-                s6.reset();
-                return false;
-            }
-            for (int i = 0; i < 2; i++) {
-                fcntl(wakeFd[i], F_SETFL, fcntl(wakeFd[i], F_GETFL, 0) | O_NONBLOCK);
-                fcntl(wakeFd[i], F_SETFD, FD_CLOEXEC);
-            }
-        }
-        return true;
-    }
-
-    void resetFragStatsLocked() {
-        reasm.clear();
-        fragSeq = 0;
-        fragSent = fragRecv = dropTooBig = mssClamped = 0;
-        v6Tx = v6Rx = 0;
-    }
-
-    void closeTunLocked() {
-        if (tunFd >= 0) {
-            close(tunFd);
-            tunFd = -1;
-        }
-    }
-
-    void resetRuntimeLocked() {
-        for (Session& s : sess) s.clear();
-        pend.wipe();
-        havePeer = false;
-        peerAddrValid = false;
-        peerLeft = false;
-        haveLast = false;
-        lastInitTs = lastTsSent = 0;
-        punchSeen.clear();
-        rxBytes = txBytes = rxPkts = txPkts = 0;
-        bcastTx = bcastRx = mcastTx = mcastRx = 0;
-        authFail = punchRx = hsRx = dropped = handshakes = 0;
-        dropForeignDst = dropNoSession = dropBadHdr = dropRxSrc = dropRxDst = tunWriteErr = 0;
-        udpQueued = udpDropped = 0;
-        resetFragStatsLocked();
-        resetFlowsLocked();
-        outq.clear();
-        udpAssoc.clear();
-        fragFix.clear();
-        udpFixups = 0;
-        rttMs = -1;
-        lastRxMs = lastTxMs = 0;
-        connectStartMs = connectedSinceMs = 0;
-        nextProbeMs = nextPingMs = nextRekeyMs = 0;
-        closeTunLocked();
-    }
-
-    void startThreadLocked() {
-        if (th.joinable()) return;
-        running = true;
-        th = std::thread([this] { loop(); });
-    }
-
-    void stopThread() {  // must be called without holding mu
-        if (!th.joinable()) return;
-        running = false;
-        wake();
-        th.join();
-    }
-
-    uint32_t newIdx() {
-        for (;;) {
-            uint32_t v;
-            randomBytes(&v, sizeof v);
-            if (v == 0) continue;
-            bool used = pend.active && pend.localIdx == v;
-            for (const Session& s : sess)
-                if (s.valid && s.localIdx == v) used = true;
-            if (!used) return v;
-        }
-    }
-
-    Session* findSession(uint32_t idx) {
-        for (Session& s : sess)
-            if (s.valid && s.localIdx == idx) return &s;
-        return nullptr;
-    }
-
-    Session* bestSession(uint64_t now) {
-        Session* best = nullptr;
-        for (Session& s : sess) {
-            if (!s.valid || !s.confirmed) continue;
-            if (now - s.createdMs >= (uint64_t)cfg.rejectAfterMs) continue;
-            if (!best || s.createdMs > best->createdMs) best = &s;
-        }
-        return best;
-    }
-
-    Session* allocSession() {
-        for (Session& s : sess)
-            if (!s.valid) return &s;
-        Session* oldest = &sess[0];
-        for (Session& s : sess)
-            if (s.createdMs < oldest->createdMs) oldest = &s;
-        oldest->clear();
-        return oldest;
-    }
-
-    void expireSessions(uint64_t now) {
-        for (Session& s : sess)
-            if (s.valid && now - s.createdMs >= (uint64_t)cfg.rejectAfterMs) s.clear();
-    }
-
-    bool pathFresh(uint64_t now) const { return peerAddrValid && now - peerAddrMs < 30000; }
-
-    void failLocked(const std::string& why) {
-        lastErr = why;
-        LBLOG("ошибка: %s", why.c_str());
-        setState(ST_FAILED);
-    }
-
-    void failTunLocked(const std::string& why) {
-        closeTunLocked();
-        failLocked(why);
-    }
-
-    // ------------------------------------------------------------ sending
-    bool wouldBlock(int e) const { return e == EAGAIN || e == EWOULDBLOCK || e == ENOBUFS; }
-
-    void noteTxError(const Addr& to, int e) {
-        (to.v6 ? txErr6 : txErr4)++;
-        int& last = lastTxErrno[to.v6 ? 1 : 0];
-        if (last != e) LBLOG("отправка на %s: %s", addrStr(to).c_str(), strerror(e));
-        last = e;
-    }
-
-    void sendRaw(const Addr& to, const uint8_t* b, size_t n) {
-        UdpSocket* us = sockFor(to);
-        if (!us || n > sizeof(OutPkt::data)) {
-            if (!us) noRoute++;
-            return;
-        }
-        if (outq.empty()) {
-            ssize_t r = us->sendTo(to, b, n);
-            if (r >= 0) return;
-            if (!wouldBlock(errno)) {
-                noteTxError(to, errno);
-                return;
-            }
-        }
-        if (outq.size() >= 2048) {
-            udpDropped++;
-            return;
-        }
-        OutPkt p;
-        p.to = to;
-        p.len = (uint16_t)n;
-        memcpy(p.data, b, n);
-        outq.push_back(p);
-        udpQueued++;
-    }
-
-    void flushOut() {
-        while (!outq.empty()) {
-            const OutPkt& p = outq.front();
-            UdpSocket* us = sockFor(p.to);
-            if (us) {
-                ssize_t r = us->sendTo(p.to, p.data, p.len);
-                if (r < 0) {
-                    if (wouldBlock(errno)) break;
-                    noteTxError(p.to, errno);
-                }
-            }
-            outq.pop_front();
-        }
-    }
-
-    void sendToCands(const uint8_t* b, size_t n, const Addr* skip) {
-        for (const Addr& a : peerCands) {
-            if (skip && a == *skip) continue;
-            sendRaw(a, b, n);
-        }
-    }
-
-    void sendToPeer(const uint8_t* b, size_t n, uint64_t now) {
-        bool fresh = pathFresh(now);
-        if (fresh) sendRaw(peerAddr, b, n);
-        if (!fresh || !lastRxMs || now - lastRxMs > 8000) sendToCands(b, n, fresh ? &peerAddr : nullptr);
-    }
-
-    void sendHandshake(const uint8_t* b, size_t n) {
-        sendToCands(b, n, peerAddrValid ? &peerAddr : nullptr);
-        if (peerAddrValid) sendRaw(peerAddr, b, n);
-    }
-
-    void sendPunch() {
-        uint8_t p[PUNCH_LEN];
-        p[0] = T_PUNCH;
-        memcpy(p + 1, sid, 8);
-        randomBytes(p + 9, 4);
-        sendHandshake(p, PUNCH_LEN);
-    }
-
-    void sendTransport(Session* s, const uint8_t* plain, size_t plen, uint64_t now) {
-        if (plen > MAX_PLAIN) return;
-        uint8_t out[DATA_HDR + MAX_PLAIN + AEAD_TAG];
-        out[0] = T_DATA;
-        putLe32(out + 1, s->remoteIdx);
-        putLe64(out + 5, s->sendCtr);
-        crypto::aeadEncrypt(out + DATA_HDR, s->sendKey, s->sendCtr, nullptr, 0, plain, plen);
-        s->sendCtr++;
-        sendToPeer(out, DATA_HDR + plen + AEAD_TAG, now);
-        lastTxMs = now;
-    }
-
-    void sendKeepalive(Session* s, uint64_t now) { sendTransport(s, nullptr, 0, now); }
-
-    void sendPing(Session* s, uint64_t now) {
-        uint8_t p[10];
-        p[0] = K_CTRL;
-        p[1] = C_PING;
-        putBe64(p + 2, now);
-        sendTransport(s, p, sizeof p, now);
-    }
-
-    void sendBye(uint64_t now) {
-        Session* s = bestSession(now);
-        if (!s) return;
-        uint8_t b = K_BYE;
-        sendTransport(s, &b, 1, now);
-        sendTransport(s, &b, 1, now);
-    }
-
-    void updatePath(const Addr& src, uint64_t now) {
-        if (!peerAddrValid || src != peerAddr) {
-            LBLOG("путь до друга: %s", addrStr(src).c_str());
-            peerAddr = src;
-        }
-        peerAddrValid = true;
-        peerAddrMs = now;
-    }
-
-    // ------------------------------------------------------------ handshake driving
-    void newInitiation(uint64_t now) {
-        uint64_t ts = wallMs();
-        if (ts <= lastTsSent) ts = lastTsSent + 1;
-        lastTsSent = ts;
-        pend.wipe();
-        uint32_t idx = newIdx();
-        if (!hsCreateInitiation(pend, kp, peer.pub, ts, idx)) {
-            pend.active = false;
-            LBLOG("handshake: не удалось создать запрос");
-            return;
-        }
-        pend.createdMs = now;
-    }
-
-    void probe(uint64_t now) {
-        if (now < nextProbeMs) return;
-        uint64_t el = now - connectStartMs;
-        nextProbeMs = now + (uint64_t)(el < (uint64_t)cfg.probeSlowAfterMs ? cfg.probeIntervalMs : cfg.probeSlowIntervalMs);
-        if (initiator) {
-            if (!pend.active || now - pend.createdMs >= (uint64_t)cfg.hsRefreshMs) newInitiation(now);
-            if (pend.active) sendHandshake(pend.msg1, MSG1_LEN);
+// Opens the missing sockets. IPv4 and IPv6 are independent: the tunnel works with one of them, and a failure of
+// the other family is only logged (a device or a network without IPv6 is normal).
+bool Impl::openSocketLocked() {
+    for (int fam = 0; fam < 2; fam++) {
+        std::unique_ptr<UdpSocket>& slot = fam ? s6 : s4;
+        std::string& why = fam ? sockErr6 : sockErr4;
+        if (slot) continue;
+        std::string err;
+        slot = factory ? factory(fam == 1, err) : openSysUdp(fam == 1, err);
+        if (slot && slot->v6() != (fam == 1)) slot.reset();  // a factory that returned the wrong family
+        if (!slot) {
+            why = err.empty() ? "сокет не создан" : err;
+            LBLOG("транспорт %s недоступен: %s", fam ? "IPv6" : "IPv4", why.c_str());
         } else {
-            sendPunch();
+            why.clear();
+            LBLOG("транспорт %s: порт %u", fam ? "IPv6" : "IPv4", (unsigned)slot->port());
         }
     }
-
-    void rekey(Session* cur, uint64_t now) {
-        if (now - cur->createdMs < (uint64_t)cfg.rekeyAfterMs) return;
-        if (now < nextRekeyMs) return;
-        nextRekeyMs = now + 1000;
-        if (!pend.active || now - pend.createdMs >= (uint64_t)cfg.hsRefreshMs) newInitiation(now);
-        if (pend.active) sendToPeer(pend.msg1, MSG1_LEN, now);
+    if (!haveSocket()) {
+        lastErr = sockErr4.empty() ? sockErr6 : (sockErr6.empty() ? sockErr4 : sockErr4 + "; " + sockErr6);
+        return false;
     }
-
-    void stunKeepalive(uint64_t now) {
-        stunPend.erase(std::remove_if(stunPend.begin(), stunPend.end(),
-                                      [now](const StunPend& p) { return now - p.sentMs > 8000; }),
-                       stunPend.end());
-        int sent[2] = {0, 0};  // at most two servers per address family
-        for (size_t i = 0; i < stun.size(); i++) {
-            if (!stun[i].ok) continue;
-            int& cnt = sent[stun[i].addr.v6 ? 1 : 0];
-            if (cnt >= 2) continue;
-            StunPend p;
-            randomBytes(p.txid, 12);
-            p.srv = i;
-            p.sentMs = now;
-            uint8_t req[20];
-            stunBuildRequest(req, p.txid);
-            sendRaw(stun[i].addr, req, sizeof req);
-            stunPend.push_back(p);
-            cnt++;
+    if (wakeFd[0] < 0) {
+        if (pipe(wakeFd) < 0) {
+            lastErr = strfmt("pipe: %s", strerror(errno));
+            wakeFd[0] = wakeFd[1] = -1;
+            s4.reset();
+            s6.reset();
+            return false;
+        }
+        for (int i = 0; i < 2; i++) {
+            fcntl(wakeFd[i], F_SETFL, fcntl(wakeFd[i], F_GETFL, 0) | O_NONBLOCK);
+            fcntl(wakeFd[i], F_SETFD, FD_CLOEXEC);
         }
     }
+    return true;
+}
 
-    // ------------------------------------------------------------ main loop
-    void loop() {
-        while (running.load()) {
-            int timeout;
-            int tfd;
-            int fd4 = -1, fd6 = -1;
-            bool out4 = false, out6 = false;  // the queue is a FIFO: only the socket of its head packet matters
-            {
-                std::lock_guard<std::mutex> g(mu);
-                if (!outq.empty()) (outq.front().to.v6 ? out6 : out4) = true;
-                fd4 = s4 ? s4->fd() : -1;
-                fd6 = s6 ? s6->fd() : -1;
-                int64_t t = (int64_t)nextTickMs - (int64_t)nowMs();
-                if (t < 0) t = 0;
-                if (t > 1000) t = 1000;
-                timeout = (int)t;
-                tfd = tunFd;
+void Impl::resetFragStatsLocked() {
+    for (auto& p : peers) p->reasm.clear();
+    fragSeq = 0;
+    fragSent = fragRecv = dropTooBig = mssClamped = 0;
+    v6Tx = v6Rx = 0;
+}
+
+void Impl::closeTunLocked() {
+    if (tunFd >= 0) {
+        close(tunFd);
+        tunFd = -1;
+    }
+}
+
+void Impl::resetRuntimeLocked() {
+    for (auto& p : peers) {
+        for (Session& s : p->sess) s.clear();
+        p->pend.wipe();
+    }
+    for (GuestSess& g : grp.guests) g.s.clear();
+    peers.clear();
+    doomed.clear();
+    havePeer = false;
+    crypto::wipe(grp.secret, sizeof grp.secret);
+    crypto::wipe(&grp.guest, sizeof grp.guest);
+    grp = GroupState();
+    view = NetView();
+    viewKey.clear();
+    layoutVer = 0;
+    ll6.clear();
+    pokes.clear();
+    rxBytes = txBytes = rxPkts = txPkts = 0;
+    bcastTx = bcastRx = mcastTx = mcastRx = 0;
+    authFail = punchRx = hsRx = dropped = handshakes = dupDropped = 0;
+    dropForeignDst = dropNoSession = dropBadHdr = dropRxSrc = dropRxDst = tunWriteErr = 0;
+    udpQueued = udpDropped = 0;
+    resetFragStatsLocked();
+    resetFlowsLocked();
+    outq.clear();
+    udpAssoc.clear();
+    fragFix.clear();
+    udpFixups = 0;
+    lastRxMs = lastTxMs = 0;
+    connectStartMs = connectedSinceMs = 0;
+    closeTunLocked();
+}
+
+void Impl::startThreadLocked() {
+    if (th.joinable()) return;
+    running = true;
+    th = std::thread([this] { loop(); });
+}
+
+void Impl::stopThread() {  // must be called without holding mu
+    if (!th.joinable()) return;
+    running = false;
+    wake();
+    th.join();
+}
+
+void Impl::failLocked(const std::string& why) {
+    lastErr = why;
+    LBLOG("ошибка: %s", why.c_str());
+    setState(ST_FAILED);
+}
+
+void Impl::failTunLocked(const std::string& why) {
+    closeTunLocked();
+    failLocked(why);
+}
+
+// ============================================================ STUN
+
+void Impl::stunKeepalive(uint64_t now) {
+    stunPend.erase(std::remove_if(stunPend.begin(), stunPend.end(),
+                                  [now](const StunPend& p) { return now - p.sentMs > 8000; }),
+                   stunPend.end());
+    int sent[2] = {0, 0};  // at most two servers per address family
+    for (size_t i = 0; i < stun.size(); i++) {
+        if (!stun[i].ok) continue;
+        int& cnt = sent[stun[i].addr.v6 ? 1 : 0];
+        if (cnt >= 2) continue;
+        StunPend p;
+        randomBytes(p.txid, 12);
+        p.srv = i;
+        p.sentMs = now;
+        uint8_t req[20];
+        stunBuildRequest(req, p.txid);
+        sendRaw(stun[i].addr, req, sizeof req);
+        stunPend.push_back(p);
+        cnt++;
+    }
+}
+
+void Impl::onStun(const uint8_t* b, size_t n) {
+    int st = state.load();
+    if (!(st == ST_READY || (grp.role == 1 && st >= ST_CONNECTING && st <= ST_STALLED))) return;
+    uint8_t tx[12];
+    if (!stunGetTxid(b, n, tx)) return;
+    for (size_t i = 0; i < stunPend.size(); i++) {
+        if (memcmp(stunPend[i].txid, tx, 12) != 0) continue;
+        size_t si = stunPend[i].srv;
+        stunPend.erase(stunPend.begin() + (long)i);
+        Addr m;
+        if (si < stun.size() && stunParseResponse(b, n, tx, m)) {
+            StunServer& s = stun[si];
+            if (s.ok && s.mapped != m) {
+                mappingChanged = true;
+                LBLOG("STUN: внешний адрес изменился %s -> %s", addrStr(s.mapped).c_str(), addrStr(m).c_str());
+                s.mapped = m;
             }
-            pollfd fds[4];
-            int nf = 0, ti = -1, i4 = -1, i6 = -1;
-            fds[nf++] = pollfd{wakeFd[0], POLLIN, 0};
-            if (fd4 >= 0) {
-                i4 = nf;
-                fds[nf++] = pollfd{fd4, (short)(POLLIN | (out4 ? POLLOUT : 0)), 0};
-            }
-            if (fd6 >= 0) {
-                i6 = nf;
-                fds[nf++] = pollfd{fd6, (short)(POLLIN | (out6 ? POLLOUT : 0)), 0};
-            }
-            if (tfd >= 0) {
-                ti = nf;
-                fds[nf++] = pollfd{tfd, POLLIN, 0};
-            }
-            int r = poll(fds, (nfds_t)nf, timeout);
-            if (r < 0 && errno != EINTR) usleep(10000);
+        }
+        return;
+    }
+}
+
+// Creator: empty datagrams to the addresses of newcomers (see Engine::openHint) open the creator's NAT for them.
+void Impl::sendPokes(uint64_t now) {
+    for (size_t i = 0; i < pokes.size();) {
+        Poke& k = pokes[i];
+        if (now >= k.until) {
+            pokes.erase(pokes.begin() + (long)i);
+            continue;
+        }
+        if (now >= k.next) {
+            uint8_t pk[PUNCH_LEN];
+            pk[0] = T_PUNCH;
+            randomBytes(pk + 1, PUNCH_LEN - 1);  // matches no peer: the receiver drops it
+            sendRaw(k.a, pk, PUNCH_LEN);
+            k.next = now + 400;
+        }
+        i++;
+    }
+}
+
+// ============================================================ main loop
+
+void Impl::loop() {
+    while (running.load()) {
+        int timeout;
+        int tfd;
+        int fd4 = -1, fd6 = -1;
+        bool out4 = false, out6 = false;  // the queue is a FIFO: only the socket of its head packet matters
+        {
             std::lock_guard<std::mutex> g(mu);
-            if (!running.load()) break;
-            uint64_t now = nowMs();
-            if (r > 0) {
-                if (fds[0].revents & POLLIN) drainWake();
-                if ((i4 >= 0 && (fds[i4].revents & POLLOUT)) || (i6 >= 0 && (fds[i6].revents & POLLOUT))) flushOut();
-                if (i4 >= 0 && (fds[i4].revents & POLLIN) && s4) readUdp(s4.get(), now);
-                if (i6 >= 0 && (fds[i6].revents & POLLIN) && s6) readUdp(s6.get(), now);
-                if (ti >= 0 && tunFd == tfd && fds[ti].revents) readTun(now, fds[ti].revents);
-            }
-            if (!outq.empty()) flushOut();
-            tick(now);
+            if (!outq.empty()) (outq.front().to.v6 ? out6 : out4) = true;
+            fd4 = s4 ? s4->fd() : -1;
+            fd6 = s6 ? s6->fd() : -1;
+            int64_t t = (int64_t)nextTickMs - (int64_t)nowMs();
+            if (t < 0) t = 0;
+            if (t > 1000) t = 1000;
+            timeout = (int)t;
+            tfd = tunFd;
         }
-    }
-
-    void tick(uint64_t now) {
-        gcAssoc(now);
-        uint64_t due = now + 1000;
-        int st = state.load();
-        if (st == ST_READY) {
-            if (now >= nextStunMs) {
-                stunKeepalive(now);
-                nextStunMs = now + (uint64_t)cfg.stunKeepMs;
-            }
-            due = nextStunMs;
-        } else if (st == ST_CONNECTING || st == ST_CONNECTED || st == ST_STALLED) {
-            expireSessions(now);
-            Session* cur = bestSession(now);
-            if (!cur) {
-                if (st != ST_CONNECTING) {
-                    setState(ST_CONNECTING);
-                    connectStartMs = now;
-                    nextProbeMs = 0;
-                }
-                if (peerCands.empty()) {
-                    auto fn = [](int f) { return f == 3 ? "IPv4 и IPv6" : f == 2 ? "только IPv6" : f == 1 ? "только IPv4" : "нет"; };
-                    failLocked(strfmt("нет общего сетевого протокола с другом (у вас: %s, у друга: %s)",
-                                      fn(offerFamilies(myOffer)), fn(offerFamilies(peer))));
-                } else if (now - connectStartMs >= (uint64_t)cfg.connectTimeoutMs) {
-                    failLocked("друг не ответил за отведённое время");
-                } else {
-                    probe(now);
-                    due = std::min(due, std::max(nextProbeMs, now + 1));
-                }
-            } else {
-                bool fresh = lastRxMs && now - lastRxMs < (uint64_t)cfg.stallMs;
-                if (!fresh && st == ST_CONNECTED) setState(ST_STALLED);
-                if (now - lastTxMs >= (uint64_t)cfg.keepaliveMs) sendKeepalive(cur, now);
-                if (now >= nextPingMs) {
-                    sendPing(cur, now);
-                    nextPingMs = now + (uint64_t)cfg.pingMs;
-                }
-                if (initiator) rekey(cur, now);
-                if (lastRxMs && now - lastRxMs > 8000 && now >= nextProbeMs) {
-                    sendPunch();
-                    nextProbeMs = now + 3000;
-                }
-                due = now + 500;
-            }
+        pollfd fds[4];
+        int nf = 0, ti = -1, i4 = -1, i6 = -1;
+        fds[nf++] = pollfd{wakeFd[0], POLLIN, 0};
+        if (fd4 >= 0) {
+            i4 = nf;
+            fds[nf++] = pollfd{fd4, (short)(POLLIN | (out4 ? POLLOUT : 0)), 0};
         }
-        nextTickMs = due;
-    }
-
-    // ------------------------------------------------------------ receiving: UDP
-    void readUdp(UdpSocket* us, uint64_t now) {
-        uint8_t buf[2600];
-        for (int i = 0; i < 256; i++) {
-            Addr from;
-            ssize_t n = us->recvFrom(buf, sizeof buf, from);
-            if (n < 0) break;
-            if (n == 0) continue;
-            onUdp(buf, (size_t)n, from, now);
+        if (fd6 >= 0) {
+            i6 = nf;
+            fds[nf++] = pollfd{fd6, (short)(POLLIN | (out6 ? POLLOUT : 0)), 0};
         }
-    }
-
-    void onUdp(const uint8_t* b, size_t n, const Addr& src, uint64_t now) {
-        if (stunIsMessage(b, n)) {
-            onStun(b, n);
-            return;
+        if (tfd >= 0) {
+            ti = nf;
+            fds[nf++] = pollfd{tfd, POLLIN, 0};
         }
-        int st = state.load();
-        if (st < ST_CONNECTING || st > ST_STALLED) return;
-        switch (b[0]) {
-            case T_PUNCH: onPunch(b, n, src); break;
-            case T_MSG1: onMsg1(b, n, src, now); break;
-            case T_MSG2: onMsg2(b, n, src, now); break;
-            case T_DATA: onData(b, n, src, now); break;
-            default: break;
-        }
-    }
-
-    void onStun(const uint8_t* b, size_t n) {
-        if (state.load() != ST_READY) return;
-        uint8_t tx[12];
-        if (!stunGetTxid(b, n, tx)) return;
-        for (size_t i = 0; i < stunPend.size(); i++) {
-            if (memcmp(stunPend[i].txid, tx, 12) != 0) continue;
-            size_t si = stunPend[i].srv;
-            stunPend.erase(stunPend.begin() + (long)i);
-            Addr m;
-            if (si < stun.size() && stunParseResponse(b, n, tx, m)) {
-                StunServer& s = stun[si];
-                if (s.ok && s.mapped != m) {
-                    mappingChanged = true;
-                    LBLOG("STUN: внешний адрес изменился %s -> %s", addrStr(s.mapped).c_str(), addrStr(m).c_str());
-                    s.mapped = m;
-                }
-            }
-            return;
-        }
-    }
-
-    void onPunch(const uint8_t* b, size_t n, const Addr& src) {
-        if (!havePeer || n != PUNCH_LEN || memcmp(b + 1, sid, 8) != 0) return;
-        punchRx++;
-        bool seen = false;
-        for (const Addr& a : punchSeen)
-            if (a == src) seen = true;
-        if (!seen && punchSeen.size() < 8) {
-            punchSeen.push_back(src);
-            LBLOG("получен пробный пакет от %s", addrStr(src).c_str());
-        }
-        if (initiator && pend.active && !bestSession(nowMs())) sendRaw(src, pend.msg1, MSG1_LEN);
-    }
-
-    void authFailed(const char* what, uint64_t now) {
-        authFail++;
-        if (now - lastAuthLogMs > 3000) {
-            lastAuthLogMs = now;
-            LBLOG("пакет не прошёл проверку (%s): пароль или код не совпадают", what);
-        }
-    }
-
-    void onMsg1(const uint8_t* b, size_t n, const Addr& src, uint64_t now) {
-        if (!havePeer || initiator || n != MSG1_LEN) return;
-        if (haveLast && memcmp(b, lastMsg1, MSG1_LEN) == 0) {  // retransmission: repeat the same answer
-            sendRaw(src, lastMsg2, MSG2_LEN);
-            return;
-        }
-        HsRespIn in;
-        if (!hsConsumeInitiation(b, n, kp, peer.pub, in)) {
-            authFailed("запрос", now);
-            return;
-        }
-        if (in.ts <= lastInitTs) {
-            dropped++;
-            return;
-        }
-        lastInitTs = in.ts;
-        uint32_t idx = newIdx();
-        TransportKeys keys;
-        uint8_t m2[MSG2_LEN];
-        if (!hsCreateResponse(in, kp, peer.pub, psk, idx, m2, keys)) return;
-        Session* s = allocSession();
-        s->clear();
-        s->valid = true;
-        s->confirmed = false;
-        s->initiator = false;
-        s->localIdx = idx;
-        s->remoteIdx = in.senderIdx;
-        memcpy(s->sendKey, keys.send, 32);
-        memcpy(s->recvKey, keys.recv, 32);
-        s->createdMs = now;
-        s->lastRxMs = now;
-        crypto::wipe(&keys, sizeof keys);
-        memcpy(lastMsg1, b, MSG1_LEN);
-        memcpy(lastMsg2, m2, MSG2_LEN);
-        haveLast = true;
-        hsRx++;
-        updatePath(src, now);
-        sendRaw(src, m2, MSG2_LEN);
-        LBLOG("получен запрос соединения от %s", addrStr(src).c_str());
-    }
-
-    void onMsg2(const uint8_t* b, size_t n, const Addr& src, uint64_t now) {
-        if (!havePeer || !initiator || !pend.active || n != MSG2_LEN) return;
-        uint32_t myIdx = pend.localIdx;
-        uint32_t remoteIdx = 0;
-        TransportKeys keys;
-        if (!hsConsumeResponse(pend, b, n, kp, psk, remoteIdx, keys)) {
-            if (le32(b + 5) == myIdx) authFailed("ответ", now);
-            return;
-        }
-        Session* s = allocSession();
-        s->clear();
-        s->valid = true;
-        s->confirmed = true;
-        s->initiator = true;
-        s->localIdx = myIdx;
-        s->remoteIdx = remoteIdx;
-        memcpy(s->sendKey, keys.send, 32);
-        memcpy(s->recvKey, keys.recv, 32);
-        s->createdMs = now;
-        s->lastRxMs = now;
-        crypto::wipe(&keys, sizeof keys);
-        hsRx++;
-        handshakes++;
-        lastRxMs = now;
-        updatePath(src, now);
-        if (state.load() != ST_CONNECTED) {
-            if (!connectedSinceMs) connectedSinceMs = now;
-            setState(ST_CONNECTED);
-            LBLOG("соединение установлено (%s)", addrStr(src).c_str());
-        }
-        peerLeft = false;
-        sendKeepalive(s, now);  // confirms the new keys to the responder
-    }
-
-    void onData(const uint8_t* b, size_t n, const Addr& src, uint64_t now) {
-        if (n < DATA_HDR + AEAD_TAG) return;
-        Session* s = findSession(le32(b + 1));
-        if (!s) {
-            dropped++;
-            return;
-        }
-        uint64_t ctr = le64(b + 5);
-        if (!s->replay.check(ctr)) {
-            dropped++;
-            return;
-        }
-        size_t plen = n - DATA_HDR - AEAD_TAG;
-        if (plen > MAX_PLAIN) return;
-        uint8_t plain[MAX_PLAIN + 1];
-        if (!crypto::aeadDecrypt(plain, s->recvKey, ctr, nullptr, 0, b + DATA_HDR, n - DATA_HDR)) {
-            authFailed("данные", now);
-            return;
-        }
-        s->replay.update(ctr);
-        s->lastRxMs = now;
-        lastRxMs = now;
-        if (!s->confirmed) {
-            s->confirmed = true;
-            handshakes++;
-        }
-        updatePath(src, now);
-        peerLeft = false;
-        if (state.load() != ST_CONNECTED) {
-            if (!connectedSinceMs) connectedSinceMs = now;
-            setState(ST_CONNECTED);
-            LBLOG("соединение установлено (%s)", addrStr(src).c_str());
-        }
-        handlePlain(s, plain, plen, now);
-    }
-
-    void handlePlain(Session* s, const uint8_t* p, size_t n, uint64_t now) {
-        if (n == 0) return;  // keepalive
-        switch (p[0]) {
-            case K_IP: deliverIp(p + 1, n - 1); break;
-            case K_FRAG:
-                if (n > FRAG_HDR) {
-                    std::vector<uint8_t> whole;
-                    if (reasm.add(be16(p + 1), p[3], p[4], p + FRAG_HDR, n - FRAG_HDR, now, whole)) {
-                        fragRecv++;
-                        deliverIp(whole.data(), whole.size());
-                    }
-                }
-                break;
-            case K_CTRL:
-                if (n >= 10 && p[1] == C_PING) {
-                    uint8_t r[10];
-                    memcpy(r, p, 10);
-                    r[1] = C_PONG;
-                    sendTransport(s, r, sizeof r, now);
-                } else if (n >= 10 && p[1] == C_PONG) {
-                    uint64_t t = be64(p + 2);
-                    if (t <= now && now - t < 60000) rttMs = (int64_t)(now - t);
-                }
-                break;
-            case K_BYE:
-                peerLeft = true;
-                if (state.load() == ST_CONNECTED) setState(ST_STALLED);
-                LBLOG("друг отключился");
-                break;
-            default: break;
-        }
-    }
-
-    // ------------------------------------------------------------ TUN side
-    static bool inVec(const std::vector<uint32_t>& v, uint32_t x) {
-        for (uint32_t y : v)
-            if (y == x) return true;
-        return false;
-    }
-    static bool inVec6(const std::vector<Ip6>& v, const Ip6& x) {
-        for (const Ip6& y : v)
-            if (y == x) return true;
-        return false;
-    }
-    bool isPeerAddr(uint32_t ip) const { return ip == lay.peerIp || inVec(lay.aliasPeer, ip); }
-    bool isMyAddr(uint32_t ip) const { return ip == lay.myIp || inVec(lay.aliasMine, ip); }
-    bool isPeerAddr6(const Ip6& a) const { return a == lay.peerIp6 || inVec6(lay.aliasPeer6, a); }
-    bool isMyAddr6(const Ip6& a) const { return a == lay.myIp6 || inVec6(lay.aliasMine6, a); }
-    static Ip6 srcOf6(const uint8_t* ip) {
-        Ip6 a;
-        memcpy(a.data(), ip + 8, 16);
-        return a;
-    }
-    static Ip6 dstOf6(const uint8_t* ip) {
-        Ip6 a;
-        memcpy(a.data(), ip + 24, 16);
-        return a;
-    }
-
-    void resetFlowsLocked() {
-        flowTab.clear();
-        flowOverflow = 0;
-        selftestPkts = 0;
-        headRing.clear();
-        tailCount = 0;
-        flowEpochMs = nowMs();
-    }
-
-    static uint16_t serviceOf(uint16_t a, uint16_t b) { return a < b ? a : b; }
-
-    // Adds one packet to the flow table and to the head/tail rings.
-    void recordFlow(PktRec r, uint16_t svc, bool isFrag, size_t tot) {
-        uint64_t rel = nowMs() - flowEpochMs;
-        r.tMs = (uint32_t)rel;
-        r.len = (uint16_t)(tot > 65535 ? 65535 : tot);
-        if (headRing.size() < 120) headRing.push_back(r);
-        tailRing[tailCount % (sizeof tailRing / sizeof tailRing[0])] = r;
-        tailCount++;
-
-        Flow* f = nullptr;
-        for (Flow& x : flowTab) {
-            if (x.dir == r.dir && x.proto == r.proto && x.v6 == r.v6 && x.svc == svc &&
-                (r.v6 ? (x.s6 == r.s6 && x.d6 == r.d6) : (x.sip == r.sip && x.dip == r.dip))) {
-                f = &x;
-                break;
-            }
-        }
-        if (!f) {
-            if (flowTab.size() >= 256) {
-                // evict the smallest entry so that busy flows are never lost
-                size_t victim = 0;
-                for (size_t k = 1; k < flowTab.size(); k++)
-                    if (flowTab[k].pkts < flowTab[victim].pkts) victim = k;
-                flowTab.erase(flowTab.begin() + (long)victim);
-                flowOverflow++;
-            }
-            Flow nf;
-            memset(&nf, 0, sizeof nf);
-            nf.dir = r.dir;
-            nf.proto = r.proto;
-            nf.v6 = r.v6;
-            nf.sip = r.sip;
-            nf.dip = r.dip;
-            nf.s6 = r.s6;
-            nf.d6 = r.d6;
-            nf.svc = svc;
-            nf.firstMs = nf.lastMs = rel;
-            flowTab.push_back(nf);
-            f = &flowTab.back();
-        }
-        f->pkts++;
-        f->bytes += tot;
-        if (tot > f->maxLen) f->maxLen = (uint16_t)(tot > 65535 ? 65535 : tot);
-        f->lastMs = rel;
-        if (isFrag) f->frags++;
-        if (r.proto == 6) {
-            uint8_t tcpFlags = r.tcpFlags;
-            if ((tcpFlags & 0x02) && !(tcpFlags & 0x10)) f->syn++;
-            else if ((tcpFlags & 0x02) && (tcpFlags & 0x10)) f->synack++;
-            if (tcpFlags & 0x04) f->rst++;
-            if (tcpFlags & 0x01) f->fin++;
-        }
-    }
-
-    void noteFlow(char dir, const uint8_t* ip, size_t tot) {
-        if (tot < 20) return;
-        size_t ihl = (size_t)(ip[0] & 15) * 4;
-        uint8_t proto = ip[9];
-        uint16_t fragField = be16(ip + 6);
-        bool firstFrag = (fragField & 0x1FFF) == 0;
-        bool isFrag = (fragField & 0x1FFF) != 0 || (fragField & 0x2000) != 0;
-        uint16_t sp = 0, dp = 0, svc = 0;
-        uint8_t tcpFlags = 0;
-        if (firstFrag && (proto == 6 || proto == 17) && tot >= ihl + 4) {
-            sp = be16(ip + ihl);
-            dp = be16(ip + ihl + 2);
-            if (sp == 41377 || dp == 41377) {
-                selftestPkts++;
-                return;
-            }
-            svc = serviceOf(sp, dp);
-            if (proto == 6 && tot >= ihl + 14) tcpFlags = ip[ihl + 13];
-        } else if (firstFrag && proto == 1 && tot >= ihl + 2) {
-            svc = ip[ihl];
-        }
-        PktRec r;
-        memset(&r, 0, sizeof r);
-        r.dir = dir;
-        r.proto = proto;
-        r.tcpFlags = tcpFlags;
-        r.ipFlags = (uint8_t)(fragField >> 13);
-        r.v6 = false;
-        r.sip = be32(ip + 12);
-        r.dip = be32(ip + 16);
-        r.sport = sp;
-        r.dport = dp;
-        recordFlow(r, svc, isFrag, tot);
-    }
-
-    void noteFlow6(char dir, const uint8_t* ip, size_t tot) {
-        Ip6Info in = ip6Parse(ip, tot);
-        if (!in.ok) return;
-        uint16_t sp = 0, dp = 0, svc = 0;
-        uint8_t tcpFlags = 0;
-        if (in.first && (in.proto == 6 || in.proto == 17) && tot >= in.l4off + 4) {
-            sp = be16(ip + in.l4off);
-            dp = be16(ip + in.l4off + 2);
-            if (sp == 41377 || dp == 41377) {
-                selftestPkts++;
-                return;
-            }
-            svc = serviceOf(sp, dp);
-            if (in.proto == 6 && tot >= in.l4off + 14) tcpFlags = ip[in.l4off + 13];
-        } else if (in.first && in.proto == 58 && tot >= in.l4off + 1) {
-            svc = ip[in.l4off];
-        }
-        PktRec r;
-        memset(&r, 0, sizeof r);
-        r.dir = dir;
-        r.proto = in.proto;
-        r.tcpFlags = tcpFlags;
-        r.ipFlags = in.fragment ? 1 : 0;
-        r.v6 = true;
-        r.s6 = srcOf6(ip);
-        r.d6 = dstOf6(ip);
-        r.sport = sp;
-        r.dport = dp;
-        recordFlow(r, svc, in.fragment, tot);
-    }
-
-    static uint64_t assocKey(uint16_t lport, uint32_t rip, uint16_t rport) {
-        return ((uint64_t)lport << 48) | ((uint64_t)rport << 32) | rip;
-    }
-
-    // Incoming unicast UDP: remember which of our addresses the peer sent it to.
-    void noteUdpIn(const uint8_t* ip, size_t tot) {
-        if (ip[9] != 17) return;
-        size_t ihl = (size_t)(ip[0] & 15) * 4;
-        if ((be16(ip + 6) & 0x1FFF) != 0 || tot < ihl + 8) return;
-        uint32_t src = be32(ip + 12), dst = be32(ip + 16);
-        if (!isMyAddr(dst)) return;
+        int r = poll(fds, (nfds_t)nf, timeout);
+        if (r < 0 && errno != EINTR) usleep(10000);
+        std::lock_guard<std::mutex> g(mu);
+        if (!running.load()) break;
         uint64_t now = nowMs();
-        if (udpAssoc.size() > 4096) udpAssoc.clear();
-        udpAssoc[assocKey(be16(ip + ihl + 2), src, be16(ip + ihl))] = UdpAssoc{dst, now};
+        if (r > 0) {
+            if (fds[0].revents & POLLIN) drainWake();
+            if ((i4 >= 0 && (fds[i4].revents & POLLOUT)) || (i6 >= 0 && (fds[i6].revents & POLLOUT))) flushOut();
+            if (i4 >= 0 && (fds[i4].revents & POLLIN) && s4) readUdp(s4.get(), now);
+            if (i6 >= 0 && (fds[i6].revents & POLLIN) && s6) readUdp(s6.get(), now);
+            if (ti >= 0 && tunFd == tfd && fds[ti].revents) readTun(now, fds[ti].revents);
+        }
+        sweepDoomed();
+        if (!outq.empty()) flushOut();
+        tick(now);
+        if (!outq.empty()) flushOut();
     }
+}
 
-    // Outgoing unicast UDP: make a reply come from the address the peer used (see udpAssoc).
-    void fixUdpOut(uint8_t* ip, size_t tot, uint64_t now) {
-        if (ip[9] != 17) return;
-        uint16_t fragField = be16(ip + 6);
-        uint32_t src = be32(ip + 12), dst = be32(ip + 16);
-        if ((fragField & 0x1FFF) != 0) {  // a later fragment follows the decision taken for the first one
-            uint16_t id = be16(ip + 4);
-            for (const FragFix& f : fragFix) {
-                if (f.expMs > now && f.src == src && f.dst == dst && f.id == id) {
-                    ipRewriteSrc(ip, tot, f.newSrc);
-                    return;
+void Impl::tick(uint64_t now) {
+    gcAssoc(now);
+    uint64_t due = now + 1000;
+    const int st = state.load();
+    const bool group = grp.role != 0;
+    const bool active = st >= ST_CONNECTING && st <= ST_STALLED;
+    // The public addresses are kept alive (and watched) while the code is waiting for somebody; a group's creator
+    // keeps doing it all the time, because newcomers can come at any moment.
+    if (haveIdentity && (st == ST_READY || (active && grp.role == 1))) {
+        if (now >= nextStunMs) {
+            stunKeepalive(now);
+            nextStunMs = now + (uint64_t)cfg.stunKeepMs;
+        }
+        due = std::min(due, nextStunMs);
+    }
+    if (group && (st == ST_READY || active)) {
+        groupTick(now);
+        std::vector<Peer*> ps;
+        for (auto& p : peers) ps.push_back(p.get());
+        for (Peer* p : ps) peerTick(p, now, due);
+        sweepDoomed();
+        sendPokes(now);
+        if (!pokes.empty()) due = std::min(due, now + 250);
+        if (active) {
+            int nconn = connectedPeers(now, (uint64_t)cfg.stallMs);
+            if (nconn > 0) {
+                if (st != ST_CONNECTED) {
+                    if (!connectedSinceMs) connectedSinceMs = now;
+                    setState(ST_CONNECTED);
                 }
-            }
-            return;
-        }
-        size_t ihl = (size_t)(ip[0] & 15) * 4;
-        if (tot < ihl + 8) return;
-        auto it = udpAssoc.find(assocKey(be16(ip + ihl), dst, be16(ip + ihl + 2)));
-        if (it == udpAssoc.end() || now - it->second.lastMs > 180000) return;
-        uint32_t want = it->second.local;
-        if (want == src) return;
-        if (fragField & 0x2000) {
-            if (fragFix.size() >= 64) fragFix.erase(fragFix.begin());
-            fragFix.push_back(FragFix{src, dst, want, be16(ip + 4), now + 10000});
-        }
-        ipRewriteSrc(ip, tot, want);
-        udpFixups++;
-    }
-
-    void gcAssoc(uint64_t now) {
-        reasm.expire(now);
-        if (now - lastAssocGcMs < 30000) return;
-        lastAssocGcMs = now;
-        for (auto it = udpAssoc.begin(); it != udpAssoc.end();) {
-            if (now - it->second.lastMs > 180000) it = udpAssoc.erase(it);
-            else ++it;
-        }
-        fragFix.erase(std::remove_if(fragFix.begin(), fragFix.end(), [now](const FragFix& f) { return f.expMs <= now; }),
-                      fragFix.end());
-    }
-
-    // Writes one IP packet into the TUN. False when it could not be written (already counted).
-    bool writeTun(const uint8_t* ip, size_t tot) {
-        ssize_t w = write(tunFd, ip, tot);
-        if (w < 0) {
-            dropped++;
-            tunWriteErr++;
-            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR && errno != EINVAL && errno != EMSGSIZE &&
-                errno != ENOBUFS)
-                failTunLocked(strfmt("TUN write: %s", strerror(errno)));
-            return false;
-        }
-        return true;
-    }
-
-    // Everything that arrives from the peer as an IP packet (also after reassembly of tunnel chunks).
-    void deliverIp(const uint8_t* ip, size_t len) {
-        if (tunFd < 0) return;
-        if (len >= 1 && (ip[0] >> 4) == 6) {
-            deliverIp6(ip, len);
-            return;
-        }
-        if (len < 20 || (ip[0] >> 4) != 4) {
-            dropped++;
-            dropBadHdr++;
-            return;
-        }
-        size_t ihl = (size_t)(ip[0] & 15) * 4;
-        size_t tot = be16(ip + 2);
-        if (ihl < 20 || ihl > len || tot < ihl || tot > len) {
-            dropped++;
-            dropBadHdr++;
-            return;
-        }
-        uint32_t src = be32(ip + 12), dst = be32(ip + 16);
-        if (!isPeerAddr(src)) {
-            dropped++;
-            dropRxSrc++;
-            noteFlow('Y', ip, tot);
-            return;
-        }
-        bool bc = dst == 0xFFFFFFFFu || dst == lay.bcast;
-        bool mc = (dst >> 28) == 0xE;
-        if (!(isMyAddr(dst) || bc || mc)) {
-            dropped++;
-            dropRxDst++;
-            noteFlow('Y', ip, tot);
-            return;
-        }
-        noteUdpIn(ip, tot);
-        if (!writeTun(ip, tot)) return;
-        noteFlow('R', ip, tot);
-        rxPkts++;
-        rxBytes += tot;
-        if (bc) bcastRx++;
-        if (mc) mcastRx++;
-    }
-
-    void deliverIp6(const uint8_t* ip, size_t len) {
-        Ip6Info in = ip6Parse(ip, len);
-        if (!in.ok) {
-            dropped++;
-            dropBadHdr++;
-            return;
-        }
-        size_t tot = in.tot;
-        if (in.first && in.proto == 58 && in.l4off < tot && icmp6LocalOnly(ip[in.l4off])) {
-            dropped++;  // neighbour/router discovery and MLD never cross the tunnel
-            return;
-        }
-        Ip6 src = srcOf6(ip), dst = dstOf6(ip);
-        // The peer is the only other host on this link, so its link-local addresses are accepted as they are.
-        if (!isPeerAddr6(src) && !ip6IsLinkLocal(src)) {
-            dropped++;
-            dropRxSrc++;
-            noteFlow6('Y', ip, tot);
-            return;
-        }
-        bool mc = ip6IsMulticast(dst);
-        bool ok = mc ? ip6McastScope(dst) > 1 : (isMyAddr6(dst) || ip6IsLinkLocal(dst));
-        if (!ok) {
-            dropped++;
-            dropRxDst++;
-            noteFlow6('Y', ip, tot);
-            return;
-        }
-        if (!writeTun(ip, tot)) return;
-        noteFlow6('R', ip, tot);
-        rxPkts++;
-        rxBytes += tot;
-        v6Rx++;
-        if (mc) mcastRx++;
-    }
-
-    void readTun(uint64_t now, short revents) {
-        uint8_t buf[4096];
-        for (int i = 0; i < 256; i++) {
-            ssize_t n = read(tunFd, buf, sizeof buf);
-            if (n < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) break;
-                failTunLocked(strfmt("TUN read: %s", strerror(errno)));
-                return;
-            }
-            if (n == 0) {
-                failTunLocked("TUN закрыт");
-                return;
-            }
-            onTunPacket(buf, (size_t)n, now);
-            if (tunFd < 0) return;
-        }
-        if ((revents & (POLLERR | POLLHUP | POLLNVAL)) && !(revents & POLLIN)) failTunLocked("TUN закрыт");
-    }
-
-    // A SYN or SYN-ACK that leaves through the tunnel gets its MSS option capped, so that the peer's TCP segments
-    // always fit into one datagram (the peer does the same for the segments we receive).
-    static constexpr unsigned kMssCap = 1240;
-    void clampMss(uint8_t* p, size_t tot, size_t l4) {
-        if (tot < l4 + 20 || !(p[l4 + 13] & 0x02)) return;
-        size_t doff = (size_t)(p[l4 + 12] >> 4) * 4;
-        if (doff < 24 || l4 + doff > tot) return;
-        size_t i = l4 + 20, end = l4 + doff;
-        while (i < end) {
-            uint8_t kind = p[i];
-            if (kind == 0) break;
-            if (kind == 1) {
-                i++;
-                continue;
-            }
-            if (i + 1 >= end) break;
-            size_t olen = p[i + 1];
-            if (olen < 2 || i + olen > end) break;
-            if (kind == 2 && olen == 4) {
-                uint16_t mss = be16(p + i + 2);
-                if (mss > kMssCap) {
-                    putBe16(p + i + 2, (uint16_t)kMssCap);
-                    uint32_t sum = (~(uint32_t)be16(p + l4 + 16)) & 0xFFFF;
-                    sum += (~(uint32_t)mss) & 0xFFFF;
-                    sum += kMssCap;
-                    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-                    putBe16(p + l4 + 16, (uint16_t)~sum);
-                    mssClamped++;
+            } else if (presentPeers() == 0) {
+                if (st != ST_CONNECTING) {
+                    connectedSinceMs = 0;
+                    setState(ST_CONNECTING);
                 }
-                return;
+            } else if (st == ST_CONNECTED) {
+                setState(ST_STALLED);
             }
-            i += olen;
         }
+    } else if (!group && active && !peers.empty()) {
+        peerTick(peers[0].get(), now, due);
     }
+    nextTickMs = due;
+}
 
-    // Sends one inner IP packet: in one datagram when it is small enough, otherwise in tunnel chunks.
-    bool sendIp(Session* cur, const uint8_t* p, size_t tot, uint64_t now) {
-        if (tot <= IP_MAX_UNFRAGMENTED) {
-            uint8_t plain[1 + IP_MAX_UNFRAGMENTED];
-            plain[0] = K_IP;
-            memcpy(plain + 1, p, tot);
-            sendTransport(cur, plain, tot + 1, now);
-            return true;
-        }
-        size_t cnt = (tot + FRAG_CHUNK - 1) / FRAG_CHUNK;
-        if (cnt > (size_t)FRAG_MAX) {
-            dropped++;
-            dropTooBig++;
-            return false;
-        }
-        uint16_t id = fragSeq++;
-        for (size_t i = 0; i < cnt; i++) {
-            size_t off = i * FRAG_CHUNK;
-            size_t len = std::min(FRAG_CHUNK, tot - off);
-            uint8_t plain[FRAG_HDR + FRAG_CHUNK];
-            plain[0] = K_FRAG;
-            putBe16(plain + 1, id);
-            plain[3] = (uint8_t)i;
-            plain[4] = (uint8_t)cnt;
-            memcpy(plain + FRAG_HDR, p + off, len);
-            sendTransport(cur, plain, FRAG_HDR + len, now);
-        }
-        fragSent++;
-        return true;
-    }
-
-    void onTunPacket(uint8_t* p, size_t n, uint64_t now) {
-        if (n >= 1 && (p[0] >> 4) == 6) {
-            onTunPacket6(p, n, now);
-            return;
-        }
-        if (n < 20 || (p[0] >> 4) != 4) return;
-        size_t ihl = (size_t)(p[0] & 15) * 4;
-        size_t tot = be16(p + 2);
-        if (ihl < 20 || ihl > n || tot < ihl || tot > n) {
-            dropBadHdr++;
-            return;
-        }
-        if (p[9] == 2) return;  // IGMP stays local
-        uint32_t dst = be32(p + 16);
-        enum { UC, BC, MC } kind;
-        if (isPeerAddr(dst)) kind = UC;
-        else if (dst == 0xFFFFFFFFu || dst == lay.bcast) kind = BC;
-        else if ((dst >> 28) == 0xE) kind = MC;
-        else {
-            dropped++;
-            dropForeignDst++;
-            noteFlow('X', p, tot);
-            return;
-        }
-        Session* cur = bestSession(now);
-        if (!cur) {
-            dropped++;
-            dropNoSession++;
-            return;
-        }
-        // Packets keep their source when it is our virtual or a mirrored real address (replies then match what the
-        // application expects); anything else is rewritten to the virtual address.
-        if (!isMyAddr(be32(p + 12))) ipRewriteSrc(p, tot, lay.myIp);
-        if (kind == UC) fixUdpOut(p, tot, now);
-        if (p[9] == 6 && (be16(p + 6) & 0x3FFF) == 0) clampMss(p, tot, ihl);
-        noteFlow('T', p, tot);
-        if (!sendIp(cur, p, tot, now)) return;
-        txPkts++;
-        txBytes += tot;
-        if (kind == BC) bcastTx++;
-        if (kind == MC) mcastTx++;
-    }
-
-    void onTunPacket6(uint8_t* p, size_t n, uint64_t now) {
-        Ip6Info in = ip6Parse(p, n);
-        if (!in.ok) {
-            dropBadHdr++;
-            return;
-        }
-        size_t tot = in.tot;
-        if (in.first && in.proto == 58 && in.l4off < tot && icmp6LocalOnly(p[in.l4off])) return;  // stays local
-        Ip6 src = srcOf6(p), dst = dstOf6(p);
-        bool mc = ip6IsMulticast(dst);
-        if (mc) {
-            if (ip6McastScope(dst) <= 1) return;  // interface-local: never leaves the device
-        } else if (!(isPeerAddr6(dst) || ip6IsLinkLocal(dst))) {
-            dropped++;
-            dropForeignDst++;
-            noteFlow6('X', p, tot);
-            return;
-        }
-        Session* cur = bestSession(now);
-        if (!cur) {
-            dropped++;
-            dropNoSession++;
-            return;
-        }
-        // Same rule as for IPv4: our virtual and mirrored real addresses (and link-local ones) stay as they are.
-        if (!isMyAddr6(src) && !ip6IsLinkLocal(src)) ip6RewriteSrc(p, tot, lay.myIp6);
-        if (in.proto == 6 && in.first && !in.fragment) clampMss(p, tot, in.l4off);
-        noteFlow6('T', p, tot);
-        if (!sendIp(cur, p, tot, now)) return;
-        txPkts++;
-        txBytes += tot;
-        v6Tx++;
-        if (mc) mcastTx++;
-    }
-};
-
-// =====================================================================
-// Public API
-// =====================================================================
+// ============================================================ public API: preparing
 
 Engine::Engine() : p_(new Impl()) {}
 
@@ -1328,8 +332,60 @@ void Engine::setConfig(const Config& c) {
     p_->cfg = c;
 }
 
+void Engine::setSocketFactory(UdpFactory f) {
+    std::lock_guard<std::mutex> g(p_->mu);
+    p_->factory = std::move(f);
+}
+
+namespace {
+
+// Public (server reflexive) candidates: up to two per family. An IPv6 one that the code already implies (an address
+// of the list with the IPv6 port) is not written twice.
+void addSrflx(Offer& o, const std::vector<Addr>& distinct) {
+    int n4 = 0, n6 = 0;
+    for (const Addr& a : distinct) {
+        int& cnt = a.v6 ? n6 : n4;
+        if (cnt >= 2 || !addrUsablePeer(a)) continue;
+        if (a.v6) {
+            bool implied = false;
+            for (const Ip6& x : o.v6) implied |= (x == a.ip6 && o.port6 == a.port);
+            if (implied) {
+                cnt++;
+                continue;
+            }
+            Candidate c{1, 0, a.port};
+            c.v6 = true;
+            c.ip6 = a.ip6;
+            o.cands.push_back(c);
+        } else {
+            o.cands.push_back(Candidate{1, a.ip4, a.port});
+        }
+        cnt++;
+    }
+}
+
+std::vector<Addr> distinctMapped(const std::vector<StunServer>& stun) {
+    std::vector<Addr> d;
+    for (const StunServer& sv : stun)
+        if (sv.ok && std::find(d.begin(), d.end(), sv.mapped) == d.end()) d.push_back(sv.mapped);
+    return d;
+}
+
+}  // namespace
+
 int Engine::prepare(const std::vector<std::string>& stunServers, const std::vector<std::string>& localIps,
                     const std::string& deviceName, int ttlSec, std::vector<uint8_t>& offerOut) {
+    return prepareCommon(false, stunServers, localIps, deviceName, ttlSec, offerOut);
+}
+
+int Engine::prepareGroup(const std::vector<std::string>& stunServers, const std::vector<std::string>& localIps,
+                         const std::string& deviceName, int ttlSec, std::vector<uint8_t>& codeOut) {
+    return prepareCommon(true, stunServers, localIps, deviceName, ttlSec, codeOut);
+}
+
+int Engine::prepareCommon(bool group, const std::vector<std::string>& stunServers,
+                          const std::vector<std::string>& localIps, const std::string& deviceName, int ttlSec,
+                          std::vector<uint8_t>& offerOut) {
     Impl& s = *p_;
     std::lock_guard<std::mutex> life(s.lifeMu);
     int st = s.state.load();
@@ -1339,6 +395,7 @@ int Engine::prepare(const std::vector<std::string>& stunServers, const std::vect
     s.stopThread();
     {
         std::lock_guard<std::mutex> g(s.mu);
+        if (s.grp.role != 0 && s.haveSocket()) s.sendBye(nowMs());  // leaving the previous group
         s.setState(ST_PREPARING);
         s.resetRuntimeLocked();
         s.haveIdentity = false;
@@ -1360,18 +417,16 @@ int Engine::prepare(const std::vector<std::string>& stunServers, const std::vect
     s.stun.clear();
     for (const StunServer& sv : servers)
         if (sv.ok) s.stun.push_back(sv);
-    // Public addresses, one entry per distinct address. The NAT type comes from IPv4 servers only: IPv6 normally has
-    // no address translation, so its answers say nothing about it.
-    std::vector<Addr> distinct;
+    // The NAT type comes from IPv4 servers only: IPv6 normally has no address translation, so its answers say nothing
+    // about it.
+    std::vector<Addr> distinct = distinctMapped(s.stun);
     std::vector<Addr> distinct4Servers;
     int servers4 = 0;
     for (const StunServer& sv : s.stun) {
-        if (std::find(distinct.begin(), distinct.end(), sv.mapped) == distinct.end()) distinct.push_back(sv.mapped);
-        if (!sv.addr.v6) {
-            servers4++;
-            if (std::find(distinct4Servers.begin(), distinct4Servers.end(), sv.mapped) == distinct4Servers.end())
-                distinct4Servers.push_back(sv.mapped);
-        }
+        if (sv.addr.v6) continue;
+        servers4++;
+        if (std::find(distinct4Servers.begin(), distinct4Servers.end(), sv.mapped) == distinct4Servers.end())
+            distinct4Servers.push_back(sv.mapped);
     }
     int nat = 0;
     if (servers4 >= 2) nat = distinct4Servers.size() == 1 ? 1 : 2;
@@ -1380,7 +435,7 @@ int Engine::prepare(const std::vector<std::string>& stunServers, const std::vect
     LBLOG("тип NAT (IPv4): %s", nat == 1 ? "конусный (EIM)" : nat == 2 ? "симметричный (EDM)" : "не определён");
 
     Offer o;
-    o.version = kOfferVersion;
+    o.version = group ? kOfferVersionGroup : kOfferVersion;
     o.expiresAt = (uint32_t)(wallMs() / 1000 + (uint64_t)(ttlSec > 0 ? ttlSec : 600));
     o.nat = (uint8_t)nat;
     o.name = sanitize(deviceName, 24);
@@ -1405,32 +460,17 @@ int Engine::prepare(const std::vector<std::string>& stunServers, const std::vect
         if (o.v6.size() >= 3 || std::find(o.v6.begin(), o.v6.end(), a6) != o.v6.end()) continue;
         o.v6.push_back(a6);
     }
-    // Public (server reflexive) candidates: up to two per family. An IPv6 one that the code already implies (an
-    // address of the list with the IPv6 port) is not written twice.
-    int n4 = 0, n6 = 0;
-    for (const Addr& a : distinct) {
-        int& cnt = a.v6 ? n6 : n4;
-        if (cnt >= 2 || !addrUsablePeer(a)) continue;
-        if (a.v6) {
-            bool implied = false;
-            for (const Ip6& x : o.v6) implied |= (x == a.ip6 && o.port6 == a.port);
-            if (implied) {
-                cnt++;
-                continue;
-            }
-            Candidate c{1, 0, a.port};
-            c.v6 = true;
-            c.ip6 = a.ip6;
-            o.cands.push_back(c);
-        } else {
-            o.cands.push_back(Candidate{1, a.ip4, a.port});
-        }
-        cnt++;
-    }
+    addSrflx(o, distinct);
     if (offerCandidates(o).empty()) {
         s.lastErr = "нет сетевых адресов";
         s.setState(ST_IDLE);
         return 2;
+    }
+    if (group) {
+        o.group = true;
+        randomBytes(o.gsecret, sizeof o.gsecret);
+        o.gthird = groupPickThird(o.gsecret, seen);
+        o.gmax = (uint8_t)kGroupMax;
     }
     crypto::genKeypair(s.kp.priv, s.kp.pub);
     memcpy(o.pub, s.kp.pub, 32);
@@ -1441,14 +481,96 @@ int Engine::prepare(const std::vector<std::string>& stunServers, const std::vect
     }
     s.myOffer = o;
     s.haveIdentity = true;
+    if (group) {
+        GroupState& gs = s.grp;
+        gs = GroupState();
+        gs.role = 1;
+        memcpy(gs.secret, o.gsecret, 32);
+        groupGuestKeys(o.gsecret, gs.guest);
+        gs.third = o.gthird;
+        gs.net4 = groupNet4(o.gthird);
+        gs.net6 = groupNet6(o.gsecret);
+        gs.maxMembers = o.gmax;
+        gs.mySlot = 1;
+        gs.joinUntilS = o.expiresAt;
+        s.rebuildNets();
+    }
     s.nextStunMs = nowMs() + (uint64_t)s.cfg.stunKeepMs;
     s.nextTickMs = 0;
     s.setState(ST_READY);
     s.startThreadLocked();
     int fam = offerFamilies(o);
-    LBLOG("код создан: кандидатов %d, адресов IPv6 %d, доступность: %s, действует до %u", (int)offerCandidates(o).size(),
-          (int)o.v6.size(), fam == 3 ? "IPv4 и IPv6" : fam == 2 ? "только IPv6" : "только IPv4", (unsigned)o.expiresAt);
+    LBLOG("%s создан: кандидатов %d, адресов IPv6 %d, доступность: %s, действует до %u", group ? "код группы" : "код",
+          (int)offerCandidates(o).size(), (int)o.v6.size(),
+          fam == 3 ? "IPv4 и IPv6" : fam == 2 ? "только IPv6" : "только IPv4", (unsigned)o.expiresAt);
+    if (group)
+        LBLOG("группа: сеть %s/24, до %d устройств", ipStr(s.grp.net4).c_str(), (int)o.gmax);
     return 0;
+}
+
+int Engine::renewGroup(int ttlSec, std::vector<uint8_t>& codeOut) {
+    Impl& s = *p_;
+    std::lock_guard<std::mutex> g(s.mu);
+    int st = s.state.load();
+    if (s.grp.role != 1 || !s.haveIdentity || !(st == ST_READY || (st >= ST_CONNECTING && st <= ST_STALLED))) return 1;
+    Offer o = s.myOffer;
+    o.expiresAt = (uint32_t)(wallMs() / 1000 + (uint64_t)(ttlSec > 0 ? ttlSec : 600));
+    // The public addresses may have changed since the first code: take the current ones.
+    o.cands.erase(std::remove_if(o.cands.begin(), o.cands.end(), [](const Candidate& c) { return c.type == 1; }),
+                  o.cands.end());
+    addSrflx(o, distinctMapped(s.stun));
+    if (!offerEncode(o, codeOut)) return 2;
+    s.myOffer = o;
+    s.grp.joinUntilS = o.expiresAt;
+    s.mappingChanged = false;
+    LBLOG("код группы продлён до %u", (unsigned)o.expiresAt);
+    return 0;
+}
+
+int Engine::joinGroup(const std::vector<uint8_t>& blob) {
+    Offer o;
+    int rc = offerDecode(blob.data(), blob.size(), o);
+    if (rc != OFFER_OK) return rc;
+    Impl& s = *p_;
+    std::lock_guard<std::mutex> g(s.mu);
+    if (!s.haveIdentity || s.state.load() != ST_READY) return OFFER_NOT_READY;
+    if (s.grp.role != 0 || s.havePeer || !s.peers.empty()) return OFFER_GROUP_BUSY;
+    if (!o.group) return OFFER_NOT_GROUP;
+    if (offerExpired(s.myOffer)) return OFFER_OWN_EXPIRED;
+    if (memcmp(o.pub, s.kp.pub, 32) == 0) return OFFER_OWN;
+    if (offerExpired(o)) return OFFER_EXPIRED;
+    uint64_t now = nowMs();
+    Peer* c = s.addPeer(1, o, blob, now);
+    if (c->cands.empty()) {
+        s.peers.clear();
+        return OFFER_NO_CANDIDATES;
+    }
+    c->isCreator = true;
+    c->guestMode = true;
+    c->initiator = true;  // the newcomer always knocks
+    GroupState gs;
+    gs.role = 2;
+    memcpy(gs.secret, o.gsecret, 32);
+    groupGuestKeys(o.gsecret, gs.guest);
+    gs.third = o.gthird;
+    gs.net4 = groupNet4(o.gthird);
+    gs.net6 = groupNet6(o.gsecret);
+    gs.maxMembers = o.gmax;
+    gs.joinState = 1;
+    gs.joinStartMs = now;
+    gs.nextJoinMs = 0;
+    s.grp = gs;
+    s.lastErr.clear();
+    for (const Candidate& k : offerCandidates(s.myOffer))
+        if (!k.v6 && k.type == 0 && (k.ip & 0xFFFFFF00u) == gs.net4)
+            LBLOG("внимание: локальная сеть этого устройства (%s) совпадает с сетью группы %s/24", ipStr(k.ip).c_str(),
+                  ipStr(gs.net4).c_str());
+    s.nextTickMs = 0;
+    s.wake();
+    int fam = offerFamilies(o);
+    LBLOG("вход в группу \"%s\": кандидатов %d, доступность %s, сеть %s/24", o.name.c_str(), (int)c->cands.size(),
+          fam == 3 ? "IPv4+IPv6" : fam == 2 ? "IPv6" : "IPv4", ipStr(gs.net4).c_str());
+    return OFFER_OK;
 }
 
 int Engine::describe(const std::vector<uint8_t>& blob, std::string& text) {
@@ -1476,8 +598,9 @@ int Engine::describe(const std::vector<uint8_t>& blob, std::string& text) {
         std::lock_guard<std::mutex> g(p_->mu);
         if (p_->haveIdentity) common = (offerFamilies(p_->myOffer) & fam) != 0 ? 1 : 0;
     }
-    text = strfmt("code=%d\nname=%s\nexpires=%u\nnat=%d\ncands=%s\nv6=%s\nfamilies=%d\ncommon=%d\n", rc,
-                  o.name.c_str(), (unsigned)o.expiresAt, (int)o.nat, c.c_str(), v6.c_str(), fam, common);
+    text = strfmt("code=%d\nname=%s\nexpires=%u\nnat=%d\ncands=%s\nv6=%s\nfamilies=%d\ncommon=%d\ngroup=%d\nmax=%d\n", rc,
+                  o.name.c_str(), (unsigned)o.expiresAt, (int)o.nat, c.c_str(), v6.c_str(), fam, common, o.group ? 1 : 0,
+                  o.group ? (int)o.gmax : 0);
     return rc;
 }
 
@@ -1487,31 +610,23 @@ int Engine::setPeer(const std::vector<uint8_t>& blob) {
     if (rc != OFFER_OK) return rc;
     Impl& s = *p_;
     std::lock_guard<std::mutex> g(s.mu);
-    if (!s.haveIdentity || s.state.load() != ST_READY) return OFFER_NOT_READY;
+    if (!s.haveIdentity || s.state.load() != ST_READY || s.grp.role != 0) return OFFER_NOT_READY;
     if (offerExpired(s.myOffer)) return OFFER_OWN_EXPIRED;
     if (memcmp(o.pub, s.kp.pub, 32) == 0) return OFFER_OWN;
+    if (o.group) return OFFER_NOT_GROUP;
     if (offerExpired(o)) return OFFER_EXPIRED;
-    s.peer = o;
+    s.peers.clear();
+    s.doomed.clear();
+    Peer* p = s.addPeer(2, o, blob, nowMs());
     s.havePeer = true;
-    s.peerCands.clear();
-    int skipped = 0;
-    for (const Candidate& k : offerCandidates(o)) {
-        Addr a = candAddr(k);
-        if (s.sockFor(a)) {
-            s.peerCands.push_back(a);
-        } else {
-            skipped++;  // a family this device has no socket for: nothing could be sent there
-        }
-    }
-    if (skipped) LBLOG("кандидатов другого семейства пропущено: %d (нет сокета)", skipped);
-    s.lay = computeLayout(s.myOffer, s.peer);
-    s.initiator = s.lay.initiator;
-    deriveSid(s.sid, s.kp.pub, s.peer.pub);
-    LBLOG("друг: \"%s\", кандидатов %d, NAT %d; сеть %s/%d, мой %s, друг %s, роль %s", s.peer.name.c_str(),
-          (int)s.peerCands.size(), (int)s.peer.nat, ipStr(s.lay.net).c_str(), s.lay.prefix, ipStr(s.lay.myIp).c_str(),
-          ipStr(s.lay.peerIp).c_str(), s.initiator ? "инициатор" : "ответчик");
+    s.lay = computeLayout(s.myOffer, o);
+    p->initiator = s.lay.initiator;
+    s.rebuildNets();
+    LBLOG("друг: \"%s\", кандидатов %d, NAT %d; сеть %s/%d, мой %s, друг %s, роль %s", o.name.c_str(), (int)p->cands.size(),
+          (int)o.nat, ipStr(s.lay.net).c_str(), s.lay.prefix, ipStr(s.lay.myIp).c_str(), ipStr(s.lay.peerIp).c_str(),
+          p->initiator ? "инициатор" : "ответчик");
     {
-        int mine = offerFamilies(s.myOffer), theirs = offerFamilies(s.peer);
+        int mine = offerFamilies(s.myOffer), theirs = offerFamilies(o);
         auto fn = [](int f) { return f == 3 ? "IPv4+IPv6" : f == 2 ? "IPv6" : f == 1 ? "IPv4" : "нет"; };
         LBLOG("доступность: у меня %s, у друга %s%s", fn(mine), fn(theirs),
               (mine & theirs) ? "" : " — общего протокола нет, соединение невозможно");
@@ -1524,10 +639,17 @@ int Engine::setPeer(const std::vector<uint8_t>& blob) {
 
 bool Engine::layout(Layout& out) {
     std::lock_guard<std::mutex> g(p_->mu);
-    if (!p_->havePeer) return false;
+    if (!p_->havePeer || p_->grp.role != 0) return false;
     out = p_->lay;
     return true;
 }
+
+std::string Engine::netLayout() {
+    std::lock_guard<std::mutex> g(p_->mu);
+    return p_->layoutText();
+}
+
+// ============================================================ public API: running
 
 int Engine::start(int tunFd, int mtu) {
     Impl& s = *p_;
@@ -1538,28 +660,43 @@ int Engine::start(int tunFd, int mtu) {
         LBLOG("старт отклонён: %s", msg);
         return code;
     };
-    if (s.state.load() != ST_READY || !s.haveIdentity || !s.havePeer || !s.haveSocket()) return fail(1, "движок не готов к запуску");
-    if (offerExpired(s.myOffer)) return fail(2, "ваш код истёк");
-    if (offerExpired(s.peer)) return fail(3, "код друга истёк");
+    const bool group = s.grp.role != 0;
+    if (s.state.load() != ST_READY || !s.haveIdentity || !s.haveSocket()) return fail(1, "движок не готов к запуску");
+    if (!group && (!s.havePeer || s.peers.empty())) return fail(1, "движок не готов к запуску");
+    if (group && s.grp.role == 2 && s.grp.joinState != 2) return fail(1, "вас ещё не приняли в группу");
+    if (group && !s.view.valid) return fail(1, "сеть группы не определена");
+    if (!group) {
+        if (offerExpired(s.myOffer)) return fail(2, "ваш код истёк");
+        if (offerExpired(s.peers[0]->offer)) return fail(3, "код друга истёк");
+    }
     if (tunFd < 0) return fail(4, "нет TUN-интерфейса");
     int fl = fcntl(tunFd, F_GETFL, 0);
     fcntl(tunFd, F_SETFL, fl | O_NONBLOCK);
 
-    for (Session& x : s.sess) x.clear();
-    s.pend.wipe();
-    s.haveLast = false;
-    s.lastInitTs = s.lastTsSent = 0;
-    s.punchSeen.clear();
-    s.peerAddrValid = false;
-    s.peerLeft = false;
+    uint64_t now = nowMs();
+    if (!group) {
+        Peer& p = *s.peers[0];
+        for (Session& x : p.sess) x.clear();
+        p.pend.wipe();
+        p.haveLast = false;
+        p.lastInitTs = p.lastTsSent = 0;
+        p.punchSeen.clear();
+        p.addrValid = false;
+        p.left = p.connected = p.everConnected = false;
+        p.rttMs = -1;
+        p.lastRxMs = p.lastTxMs = p.lastDirectRxMs = p.lastRelayRxMs = 0;
+        p.directEchoMs = p.relayEchoMs = 0;
+        p.connectedSinceMs = 0;
+        p.nextPingMs = p.nextRekeyMs = p.nextProbeMs = 0;
+        p.startMs = now;
+        p.rxBytes = p.txBytes = 0;
+        s.lastRxMs = s.lastTxMs = 0;
+        s.connectedSinceMs = 0;
+        s.outq.clear();
+    }
     s.rxBytes = s.txBytes = s.rxPkts = s.txPkts = 0;
     s.bcastTx = s.bcastRx = s.mcastTx = s.mcastRx = 0;
-    s.authFail = s.punchRx = s.hsRx = s.dropped = s.handshakes = 0;
-    s.rttMs = -1;
-    s.lastRxMs = s.lastTxMs = 0;
-    s.connectedSinceMs = 0;
-    s.nextPingMs = s.nextRekeyMs = s.nextProbeMs = 0;
-
+    s.authFail = s.punchRx = s.hsRx = s.dropped = s.handshakes = s.dupDropped = 0;
     memset(s.psk, 0, sizeof s.psk);
     s.dropForeignDst = s.dropNoSession = s.dropBadHdr = s.dropRxSrc = s.dropRxDst = s.tunWriteErr = 0;
     s.udpQueued = s.udpDropped = 0;
@@ -1568,24 +705,51 @@ int Engine::start(int tunFd, int mtu) {
     s.udpAssoc.clear();
     s.fragFix.clear();
     s.udpFixups = 0;
-    s.outq.clear();
+    s.closeTunLocked();
     s.tunFd = tunFd;
     s.mtu = mtu;
-    s.connectStartMs = nowMs();
+    s.connectStartMs = now;
     s.nextTickMs = 0;
     s.setState(ST_CONNECTING);
     s.startThreadLocked();
     s.wake();
-    LBLOG("старт: TUN fd=%d, MTU %d", tunFd, mtu);
+    LBLOG("старт: TUN fd=%d, MTU %d%s", tunFd, mtu, group ? " (группа)" : "");
+    return 0;
+}
+
+int Engine::swapTun(int newFd) {
+    Impl& s = *p_;
+    std::lock_guard<std::mutex> g(s.mu);
+    int st = s.state.load();
+    if (newFd < 0) return 1;
+    if (s.tunFd < 0 || !(st >= ST_CONNECTING && st <= ST_STALLED)) {
+        close(newFd);
+        return 1;
+    }
+    int fl = fcntl(newFd, F_GETFL, 0);
+    fcntl(newFd, F_SETFL, fl | O_NONBLOCK);
+    int old = s.tunFd;
+    s.tunFd = newFd;
+    close(old);
+    s.udpAssoc.clear();
+    s.fragFix.clear();
+    for (auto& p : s.peers) p->reasm.clear();
+    s.wake();
+    LBLOG("TUN заменён: fd=%d, версия сети %u", newFd, (unsigned)s.layoutVer);
     return 0;
 }
 
 void Engine::retry() {
     Impl& s = *p_;
     std::lock_guard<std::mutex> g(s.mu);
-    if (s.state.load() != ST_FAILED || s.tunFd < 0 || !s.havePeer) return;
-    s.connectStartMs = nowMs();
-    s.nextProbeMs = 0;
+    if (s.state.load() != ST_FAILED || s.tunFd < 0 || s.peers.empty()) return;
+    if (s.grp.role == 0 && !s.havePeer) return;
+    uint64_t now = nowMs();
+    s.connectStartMs = now;
+    for (auto& p : s.peers) {
+        p->startMs = now;
+        p->nextProbeMs = 0;
+    }
     s.nextTickMs = 0;
     s.lastErr.clear();
     s.setState(ST_CONNECTING);
@@ -1596,15 +760,13 @@ void Engine::stopInternal() {
     Impl& s = *p_;
     {
         std::lock_guard<std::mutex> g(s.mu);
-        int st = s.state.load();
-        if ((st == ST_CONNECTED || st == ST_STALLED) && s.haveSocket()) s.sendBye(nowMs());
+        if (s.engineActive() && s.haveSocket()) s.sendBye(nowMs());
     }
     s.stopThread();
     std::lock_guard<std::mutex> g(s.mu);
     s.resetRuntimeLocked();
     s.s4.reset();
     s.s6.reset();
-    s.peerCands.clear();
     for (int i = 0; i < 2; i++) {
         if (s.wakeFd[i] >= 0) close(s.wakeFd[i]);
         s.wakeFd[i] = -1;
@@ -1623,21 +785,193 @@ void Engine::stop() {
     stopInternal();
 }
 
+// ============================================================ public API: profile, members
+
+bool Engine::setProfile(const std::string& name, const std::vector<uint8_t>& avatar) {
+    if (avatar.size() > kAvatarMax) return false;
+    Impl& s = *p_;
+    std::lock_guard<std::mutex> g(s.mu);
+    std::string nm = utf8Trunc(name, kProfileNameMax);
+    if (nm == s.profName && avatar == s.avatar) return true;
+    s.profName = nm;
+    s.avatar = avatar;
+    s.profVer++;
+    if (s.profVer == 0) s.profVer = 1;
+    s.resetProfileOut();
+    s.nextTickMs = 0;
+    s.wake();
+    return true;
+}
+
+std::string Engine::members() {
+    std::lock_guard<std::mutex> g(p_->mu);
+    return p_->membersText();
+}
+
+bool Engine::memberAvatar(int slot, std::vector<uint8_t>& out) {
+    Impl& s = *p_;
+    std::lock_guard<std::mutex> g(s.mu);
+    if (s.view.valid && slot == s.view.mySlot) {
+        if (s.avatar.empty()) return false;
+        out = s.avatar;
+        return true;
+    }
+    Peer* p = s.peerBySlot(slot);
+    if (!p || p->guestMode || p->avatar.empty()) return false;
+    out = p->avatar;
+    return true;
+}
+
+// ============================================================ public API: the creator's mailbox
+
+namespace {
+
+void hintKey(const uint8_t secret[32], uint8_t key[32]) {
+    uint8_t buf[10 + 32];
+    memcpy(buf, "LBhint-key", 10);
+    memcpy(buf + 10, secret, 32);
+    crypto::blake2s(key, 32, nullptr, 0, buf, sizeof buf);
+    crypto::wipe(buf, sizeof buf);
+}
+
+}  // namespace
+
+std::string Engine::hintTopic() {
+    Impl& s = *p_;
+    std::lock_guard<std::mutex> g(s.mu);
+    if (s.grp.role == 0) return std::string();
+    uint8_t buf[12 + 32], h[32];
+    memcpy(buf, "LBhint-topic", 12);
+    memcpy(buf + 12, s.grp.secret, 32);
+    crypto::blake2s(h, 32, nullptr, 0, buf, sizeof buf);
+    static const char* hex = "0123456789abcdef";
+    std::string t = "lb";
+    for (int i = 0; i < 12; i++) {
+        t.push_back(hex[h[i] >> 4]);
+        t.push_back(hex[h[i] & 15]);
+    }
+    crypto::wipe(buf, sizeof buf);
+    return t;
+}
+
+// A newcomer's note: where it can be reached. Format: 0xB1 | counter[8] | AEAD(ts[4] | n[1] | n x (family, ip, port)).
+bool Engine::sealHint(std::vector<uint8_t>& out) {
+    Impl& s = *p_;
+    std::lock_guard<std::mutex> g(s.mu);
+    if (s.grp.role != 2 || s.grp.joinState != 1) return false;
+    std::vector<uint8_t> pl(5);
+    uint32_t ts = (uint32_t)(wallMs() / 1000);
+    pl[0] = (uint8_t)(ts >> 24);
+    pl[1] = (uint8_t)(ts >> 16);
+    pl[2] = (uint8_t)(ts >> 8);
+    pl[3] = (uint8_t)ts;
+    int n = 0;
+    for (const Candidate& c : offerCandidates(s.myOffer)) {
+        if (n >= 6) break;
+        if (c.v6) {
+            pl.push_back(6);
+            pl.insert(pl.end(), c.ip6.begin(), c.ip6.end());
+        } else {
+            pl.push_back(4);
+            for (int i = 3; i >= 0; i--) pl.push_back((uint8_t)(c.ip >> (8 * i)));
+        }
+        pl.push_back((uint8_t)(c.port >> 8));
+        pl.push_back((uint8_t)c.port);
+        n++;
+    }
+    if (n == 0) return false;
+    pl[4] = (uint8_t)n;
+    uint8_t key[32], ctrb[8];
+    hintKey(s.grp.secret, key);
+    randomBytes(ctrb, sizeof ctrb);
+    uint64_t ctr = be64(ctrb);
+    out.assign(1 + 8 + pl.size() + AEAD_TAG, 0);
+    out[0] = 0xB1;
+    memcpy(out.data() + 1, ctrb, 8);
+    crypto::aeadEncrypt(out.data() + 9, key, ctr, nullptr, 0, pl.data(), pl.size());
+    crypto::wipe(key, sizeof key);
+    return true;
+}
+
+int Engine::openHint(const std::vector<uint8_t>& note) {
+    Impl& s = *p_;
+    std::lock_guard<std::mutex> g(s.mu);
+    if (s.grp.role != 1 || !s.engineActive()) return -1;
+    if (note.size() < 1 + 8 + 5 + AEAD_TAG || note.size() > 1 + 8 + 5 + 6 * 19 + AEAD_TAG || note[0] != 0xB1) return -1;
+    uint8_t key[32];
+    hintKey(s.grp.secret, key);
+    uint64_t ctr = be64(note.data() + 1);
+    size_t clen = note.size() - 9;
+    uint8_t pl[5 + 6 * 19];
+    bool ok = crypto::aeadDecrypt(pl, key, ctr, nullptr, 0, note.data() + 9, clen);
+    crypto::wipe(key, sizeof key);
+    if (!ok) return -1;
+    size_t plen = clen - AEAD_TAG;
+    uint32_t ts = be32(pl);
+    uint64_t nowS = wallMs() / 1000;
+    if ((nowS > ts ? nowS - ts : ts - nowS) > 900) return -1;
+    size_t n = pl[4], pos = 5;
+    uint64_t now = nowMs();
+    int added = 0;
+    for (size_t i = 0; i < n; i++) {
+        Addr a;
+        if (pos + 1 > plen) break;
+        uint8_t fam = pl[pos++];
+        if (fam == 4 && pos + 6 <= plen) {
+            a = addr4(be32(pl + pos), be16(pl + pos + 4));
+            pos += 6;
+        } else if (fam == 6 && pos + 18 <= plen) {
+            Ip6 x;
+            memcpy(x.data(), pl + pos, 16);
+            a = addr6(x, be16(pl + pos + 16));
+            pos += 18;
+        } else {
+            break;
+        }
+        if (!addrUsablePeer(a) || !s.sockFor(a)) continue;
+        bool have = false;
+        for (Impl::Poke& k : s.pokes) {
+            if (k.a == a) {
+                k.until = now + 8000;
+                have = true;
+            }
+        }
+        if (!have) {
+            if (s.pokes.size() >= 16) continue;
+            Impl::Poke k;
+            k.a = a;
+            k.until = now + 8000;
+            k.next = 0;
+            s.pokes.push_back(k);
+        }
+        added++;
+    }
+    if (added) {
+        LBLOG("записка новичка: адресов для прогрева %d", added);
+        s.nextTickMs = 0;
+        s.wake();
+    }
+    return added;
+}
+
+// ============================================================ public API: status and diagnostics
+
 void Engine::status(int64_t out[STATUS_FIELDS]) {
     Impl& s = *p_;
     std::lock_guard<std::mutex> g(s.mu);
     uint64_t now = nowMs();
     memset(out, 0, sizeof(int64_t) * STATUS_FIELDS);
-    int st = s.state.load();
+    const int st = s.state.load();
+    const bool group = s.grp.role != 0;
     out[0] = st;
     out[1] = (int64_t)s.rxBytes;
     out[2] = (int64_t)s.txBytes;
     out[3] = (int64_t)s.rxPkts;
     out[4] = (int64_t)s.txPkts;
-    out[5] = s.rttMs;
+    out[5] = -1;
     out[6] = s.lastRxMs ? (int64_t)(now - s.lastRxMs) : -1;
     out[7] = (s.connectedSinceMs && (st == ST_CONNECTED || st == ST_STALLED)) ? (int64_t)((now - s.connectedSinceMs) / 1000) : 0;
-    out[8] = s.peerAddrValid ? (addrIsLocalNet(s.peerAddr) ? 1 : 0) : -1;
+    out[8] = -1;
     out[9] = (int64_t)s.bcastTx;
     out[10] = (int64_t)s.bcastRx;
     out[11] = (int64_t)s.mcastTx;
@@ -1648,21 +982,50 @@ void Engine::status(int64_t out[STATUS_FIELDS]) {
     out[16] = (int64_t)s.dropped;
     out[17] = s.mappingChanged ? 1 : 0;
     out[18] = s.myNat;
-    out[19] = s.havePeer ? (int64_t)s.peer.nat : 0;
+    out[19] = 0;
     out[20] = s.haveIdentity ? (int64_t)s.myOffer.expiresAt : 0;
     out[21] = (int64_t)s.handshakes;
-    out[22] = s.peerLeft ? 1 : 0;
+    out[22] = 0;
+    if (!group && !s.peers.empty()) {
+        const Peer& p = *s.peers[0];
+        out[5] = p.rttMs;
+        out[8] = p.addrValid ? (addrIsLocalNet(p.addr) ? 1 : 0) : -1;
+        out[19] = (int64_t)p.offer.nat;
+        out[22] = p.left ? 1 : 0;
+    } else if (group) {
+        // aggregates over the members that are in touch: the worst round trip, "local" only when every path is local
+        int64_t rtt = -1;
+        int local = 0, remote = 0;
+        for (const auto& p : s.peers) {
+            if (p->guestMode || p->left) continue;
+            if (!(p->lastRxMs && now - p->lastRxMs < (uint64_t)s.cfg.stallMs)) continue;
+            rtt = std::max(rtt, p->rttMs);
+            if (p->addrValid) (addrIsLocalNet(p->addr) ? local : remote)++;
+        }
+        out[5] = rtt;
+        out[8] = (local + remote) == 0 ? -1 : (remote == 0 ? 1 : 0);
+    }
+    out[23] = (int64_t)s.layoutVer;
+    out[24] = s.presentPeers();
+    out[25] = s.connectedPeers(now, (uint64_t)s.cfg.stallMs);
+    out[26] = s.grp.role;
+    out[27] = s.grp.joinState;
+    out[28] = group ? s.grp.mySlot : 0;
+    out[29] = s.grp.role == 1 ? (int64_t)s.grp.joinUntilS : 0;
+    out[30] = (int64_t)(s.grp.relayFwd + s.grp.relayTx);
+    out[31] = s.memberListSettled() ? 1 : 0;
 }
 
 std::string Engine::info() {
     Impl& s = *p_;
     std::lock_guard<std::mutex> g(s.mu);
     std::string o;
-    o += strfmt("path=%s\n", s.peerAddrValid ? addrStr(s.peerAddr).c_str() : "");
-    if (s.havePeer) {
+    const Peer* p0 = (s.grp.role == 0 && !s.peers.empty()) ? s.peers[0].get() : nullptr;
+    o += strfmt("path=%s\n", p0 && p0->addrValid ? addrStr(p0->addr).c_str() : "");
+    if (p0 && s.havePeer) {
         o += strfmt("myIp=%s\npeerIp=%s\nnet=%s\nprefix=%d\nrole=%s\npeerName=%s\n", ipStr(s.lay.myIp).c_str(),
                     ipStr(s.lay.peerIp).c_str(), ipStr(s.lay.net).c_str(), s.lay.prefix,
-                    s.initiator ? "initiator" : "responder", s.peer.name.c_str());
+                    p0->initiator ? "initiator" : "responder", s.displayName(p0).c_str());
         std::string ra, ap;
         for (uint32_t x : s.lay.aliasMine) ra += (ra.empty() ? "" : ",") + ipStr(x);
         for (uint32_t x : s.lay.aliasPeer) ap += (ap.empty() ? "" : ",") + ipStr(x);
@@ -1673,6 +1036,15 @@ std::string Engine::info() {
         o += strfmt("myIp6=%s\npeerIp6=%s\nnet6=%s\nprefix6=%d\n", ip6Str(s.lay.myIp6).c_str(),
                     ip6Str(s.lay.peerIp6).c_str(), ip6Str(s.lay.net6).c_str(), s.lay.prefix6);
         o += "realIp6=" + ra6 + "\naliasPeer6=" + ap6 + "\n";
+    }
+    if (s.grp.role != 0) {
+        o += strfmt("group=%s\nslot=%d\nmaxMembers=%d\nnet=%s\nmyIp=%s\nnet6=%s\nmyIp6=%s\njoinUntil=%llu\n",
+                    s.grp.role == 1 ? "creator" : "member", s.grp.mySlot, s.grp.maxMembers, ipStr(s.grp.net4).c_str(),
+                    s.view.valid ? ipStr(s.view.myIp).c_str() : "", ip6Str(s.grp.net6).c_str(),
+                    s.view.valid ? ip6Str(s.view.myIp6).c_str() : "", (unsigned long long)s.grp.joinUntilS);
+        o += strfmt("relayForwarded=%llu\nrelaySent=%llu\nduplicates=%llu\nguests=%d\npokes=%d\n",
+                    (unsigned long long)s.grp.relayFwd, (unsigned long long)s.grp.relayTx,
+                    (unsigned long long)s.dupDropped, (int)s.grp.guests.size(), (int)s.pokes.size());
     }
     o += strfmt("localPort=%u\nlocalPort6=%u\nstun=%d\nmtu=%d\n", (unsigned)(s.s4 ? s.s4->port() : 0),
                 (unsigned)(s.s6 ? s.s6->port() : 0), (int)s.stun.size(), s.mtu);
@@ -1689,111 +1061,9 @@ std::string Engine::info() {
     return o;
 }
 
-static const char* protoName(uint8_t p) {
-    return p == 6 ? "TCP" : p == 17 ? "UDP" : p == 1 ? "ICMP" : p == 58 ? "ICMPv6" : p == 2 ? "IGMP" : "IP";
-}
-
-// Flow lines show an IPv6 address as it is; packet lines put it in brackets when a port follows.
-static std::string addrText(bool v6, uint32_t v4, const Ip6& a6) { return v6 ? ip6Str(a6) : ipStr(v4); }
-
-static std::string pktLine(const char* tag, uint32_t tMs, char dir, uint8_t proto, bool v6, uint32_t sip, uint32_t dip,
-                           const Ip6& s6, const Ip6& d6, uint16_t sp, uint16_t dp, uint16_t len, uint8_t tcpFlags,
-                           uint8_t ipFlags) {
-    std::string a = addrText(v6, sip, s6), b = addrText(v6, dip, d6);
-    if (proto == 6 || proto == 17) {
-        if (sp || dp) {
-            if (v6) {
-                a = "[" + a + "]";
-                b = "[" + b + "]";
-            }
-            a += ":" + std::to_string(sp);
-            b += ":" + std::to_string(dp);
-        } else {
-            a += " (фрагмент)";
-        }
-    }
-    std::string fl;
-    if (proto == 6) {
-        if (tcpFlags & 0x02) fl += "S";
-        if (tcpFlags & 0x10) fl += "A";
-        if (tcpFlags & 0x08) fl += "P";
-        if (tcpFlags & 0x01) fl += "F";
-        if (tcpFlags & 0x04) fl += "R";
-    }
-    if (!v6 && (ipFlags & 0x2)) fl += (fl.empty() ? "" : " ") + std::string("DF");
-    if (!v6 && (ipFlags & 0x1)) fl += (fl.empty() ? "" : " ") + std::string("MF");
-    if (v6 && (ipFlags & 0x1)) fl += (fl.empty() ? "" : " ") + std::string("FRAG");
-    (void)tag;
-    return strfmt("%7.3f %c %s %s > %s len=%u%s%s\n", tMs / 1000.0, dir, protoName(proto), a.c_str(), b.c_str(),
-                  (unsigned)len, fl.empty() ? "" : " ", fl.c_str());
-}
-
-std::string Engine::flows() {
-    Impl& s = *p_;
-    std::lock_guard<std::mutex> g(s.mu);
-    std::string o = strfmt(
-        "drops foreignDst=%llu noSession=%llu badHeader=%llu rxSrc=%llu rxDst=%llu tunWrite=%llu udpQueued=%llu "
-        "udpDropped=%llu\n",
-        (unsigned long long)s.dropForeignDst, (unsigned long long)s.dropNoSession, (unsigned long long)s.dropBadHdr,
-        (unsigned long long)s.dropRxSrc, (unsigned long long)s.dropRxDst, (unsigned long long)s.tunWriteErr,
-        (unsigned long long)s.udpQueued, (unsigned long long)s.udpDropped);
-    o += strfmt("проверка LAN (порт 41377, в списках не показана): %llu пакетов; вытеснено записей: %llu; с момента сброса: %.1f с\n",
-                (unsigned long long)s.selftestPkts, (unsigned long long)s.flowOverflow,
-                (nowMs() - s.flowEpochMs) / 1000.0);
-    o += strfmt("подмен источника в ответах UDP: %llu; запомнено потоков UDP: %u\n", (unsigned long long)s.udpFixups,
-                (unsigned)s.udpAssoc.size());
-    o += strfmt("пакетов IPv6: в туннель %llu, из туннеля %llu\n", (unsigned long long)s.v6Tx, (unsigned long long)s.v6Rx);
-    o += strfmt("крупных пакетов разбито туннелем: %llu, собрано: %llu (не собрано за %d с: %llu, слишком крупных: %llu); "
-                "MSS урезан в %llu SYN\n",
-                (unsigned long long)s.fragSent, (unsigned long long)s.fragRecv, (int)(FragReassembler::kTimeoutMs / 1000),
-                (unsigned long long)s.reasm.expiredTotal(), (unsigned long long)s.dropTooBig,
-                (unsigned long long)s.mssClamped);
-    std::vector<Impl::Flow> v = s.flowTab;
-    std::sort(v.begin(), v.end(), [](const Impl::Flow& a, const Impl::Flow& b) { return a.bytes > b.bytes; });
-    o += "\nПотоки (T: в туннель, R: из туннеля, X/Y: отброшено), порт = меньший из пары:\n";
-    if (v.empty()) o += "(нет)\n";
-    for (size_t i = 0; i < v.size() && i < 60; i++) {
-        const Impl::Flow& f = v[i];
-        std::string extra;
-        if (f.proto == 6) extra = strfmt(" SYN=%u SYN-ACK=%u RST=%u FIN=%u", f.syn, f.synack, f.rst, f.fin);
-        if (f.frags) extra += strfmt(" фрагментов=%u", f.frags);
-        std::string port = (f.proto == 6 || f.proto == 17) ? strfmt(" порт %u", (unsigned)f.svc)
-                           : f.proto == 1                  ? strfmt(" тип %u", (unsigned)f.svc)
-                                                           : std::string();
-        o += strfmt("%c %s %s > %s%s пакетов=%llu байт=%llu макс=%u %.1f..%.1f с%s\n", f.dir, protoName(f.proto),
-                    addrText(f.v6, f.sip, f.s6).c_str(), addrText(f.v6, f.dip, f.d6).c_str(), port.c_str(),
-                    (unsigned long long)f.pkts,
-                    (unsigned long long)f.bytes, (unsigned)f.maxLen, f.firstMs / 1000.0, f.lastMs / 1000.0,
-                    extra.c_str());
-    }
-    o += strfmt("\nПервые пакеты (%u):\n", (unsigned)s.headRing.size());
-    for (const Impl::PktRec& r : s.headRing)
-        o += pktLine("h", r.tMs, r.dir, r.proto, r.v6, r.sip, r.dip, r.s6, r.d6, r.sport, r.dport, r.len, r.tcpFlags,
-                     r.ipFlags);
-    size_t cap = sizeof s.tailRing / sizeof s.tailRing[0];
-    size_t n = s.tailCount < cap ? s.tailCount : cap;
-    o += strfmt("\nПоследние пакеты (%u из %llu):\n", (unsigned)n, (unsigned long long)s.tailCount);
-    for (size_t i = 0; i < n; i++) {
-        const Impl::PktRec& r = s.tailRing[(s.tailCount - n + i) % cap];
-        o += pktLine("t", r.tMs, r.dir, r.proto, r.v6, r.sip, r.dip, r.s6, r.d6, r.sport, r.dport, r.len, r.tcpFlags,
-                     r.ipFlags);
-    }
-    return o;
-}
-
-void Engine::resetFlows() {
-    std::lock_guard<std::mutex> g(p_->mu);
-    p_->resetFlowsLocked();
-}
-
 std::string Engine::lastError() {
     std::lock_guard<std::mutex> g(p_->mu);
     return p_->lastErr;
-}
-
-void Engine::setSocketFactory(UdpFactory f) {
-    std::lock_guard<std::mutex> g(p_->mu);
-    p_->factory = std::move(f);
 }
 
 int Engine::socketFd() {

@@ -8,6 +8,7 @@
 //  * a stateful inbound filter per family (a datagram is accepted only from an endpoint the host has sent to);
 //  * families that cannot be used at all (the socket cannot be created, or sending fails with ENETUNREACH);
 //  * "black holes": every peer datagram of one family is dropped (a broken path);
+//  * blocked pairs of hosts (two devices that cannot reach each other) and random loss of peer datagrams;
 //  * STUN servers (Binding responses with XOR-MAPPED-ADDRESS of either family).
 #pragma once
 
@@ -79,6 +80,17 @@ public:
     std::atomic<uint64_t> sent4{0}, sent6{0}, delivered4{0}, delivered6{0};
     std::atomic<size_t> maxLen4{0}, maxLen6{0};
     std::atomic<uint16_t> nextPort{41000};
+    std::atomic<int> lossPermille{0};  // share of peer datagrams that disappear (per mille)
+    std::set<std::string> blocked;     // "from>to" host names
+
+    // Hosts `a` and `b` cannot exchange datagrams (both directions) until unblocked.
+    void block(const std::string& a, const std::string& b, bool on = true) {
+        std::lock_guard<std::mutex> g(mu);
+        for (const std::string& k : {a + ">" + b, b + ">" + a}) {
+            if (on) blocked.insert(k);
+            else blocked.erase(k);
+        }
+    }
 
     lb::UdpFactory factory(Host* h) {
         return [this, h](bool v6, std::string& err) -> std::unique_ptr<lb::UdpSocket> {
@@ -113,6 +125,8 @@ public:
         if (it == byExt.end()) return;
         Sock* rcv = it->second;
         if (rcv->v6_ != to.v6) return;
+        if (!blocked.empty() && blocked.count(from->host_.name + ">" + rcv->host_.name)) return;
+        if (lossPermille.load() > 0 && rand() % 1000 < lossPermille.load()) return;
         if (!(to.v6 ? rcv->host_.has6 : rcv->host_.has4)) return;  // the receiver has no connectivity either
         bool fw = to.v6 ? rcv->host_.fw6 : rcv->host_.fw4;
         if (fw && !rcv->sentTo_.count(lb::addrStr(fromExt))) return;

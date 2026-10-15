@@ -51,9 +51,10 @@ bool offerEncode(const Offer& o, std::vector<uint8_t>& out) {
     if (offerCandidates(o).empty()) return false;
     for (const Candidate& c : o.cands)
         if (c.port == 0 || c.type > 1) return false;
+    if (o.group && (o.gthird == 0 || o.gthird == 255 || o.gmax < 2 || o.gmax > 8)) return false;
     std::string name = o.name.substr(0, kMaxName);
-    out.push_back(kOfferVersion);
-    out.push_back(0);  // flags
+    out.push_back(o.group ? kOfferVersionGroup : kOfferVersion);
+    out.push_back(o.group ? 1 : 0);  // flags: bit 0 = group code
     uint8_t b4[4];
     putBe32(b4, o.expiresAt);
     out.insert(out.end(), b4, b4 + 4);
@@ -79,6 +80,11 @@ bool offerEncode(const Offer& o, std::vector<uint8_t>& out) {
     uint8_t b2[2];
     putBe16(b2, o.port6);
     out.insert(out.end(), b2, b2 + 2);
+    if (o.group) {
+        out.insert(out.end(), o.gsecret, o.gsecret + 32);
+        out.push_back(o.gthird);
+        out.push_back(o.gmax);
+    }
     uint8_t chk[4];
     crypto::blake2s(chk, 4, nullptr, 0, out.data(), out.size());
     out.insert(out.end(), chk, chk + 4);
@@ -87,10 +93,13 @@ bool offerEncode(const Offer& o, std::vector<uint8_t>& out) {
 
 int offerDecode(const uint8_t* p, size_t n, Offer& o) {
     if (n < 8) return OFFER_FORMAT;
-    if (p[0] != kOfferVersion) return OFFER_VERSION;
+    if (p[0] != kOfferVersion && p[0] != kOfferVersionGroup) return OFFER_VERSION;
+    const bool grp = p[0] == kOfferVersionGroup;
     // fixed part: version, flags, expiry, key, nat, name length ... candidate count, v6 count, port6, checksum
-    if (n < 2 + 4 + 32 + 1 + 1 + 1 + 1 + 2 + 4) return OFFER_FORMAT;
-    const size_t end = n - 4;  // the checksum is the last four bytes
+    if (n < 2 + 4 + 32 + 1 + 1 + 1 + 1 + 2 + 4 + (grp ? 34u : 0u)) return OFFER_FORMAT;
+    if (grp && (p[1] & 1) == 0) return OFFER_FORMAT;
+    const size_t end = n - 4;                 // the checksum is the last four bytes
+    const size_t body = end - (grp ? 34u : 0u);  // the part before the group tail
     size_t pos = 2;
     Offer r;
     r.version = p[0];
@@ -100,19 +109,19 @@ int offerDecode(const uint8_t* p, size_t n, Offer& o) {
     pos += 32;
     r.nat = p[pos++];
     size_t nl = p[pos++];
-    if (nl > kMaxName || pos + nl + 1 > end) return OFFER_FORMAT;
+    if (nl > kMaxName || pos + nl + 1 > body) return OFFER_FORMAT;
     r.name.assign((const char*)p + pos, nl);
     pos += nl;
     size_t nc = p[pos++];
     if (nc > kMaxCands) return OFFER_FORMAT;
     for (size_t i = 0; i < nc; i++) {
-        if (pos + 1 > end) return OFFER_FORMAT;
+        if (pos + 1 > body) return OFFER_FORMAT;
         uint8_t tag = p[pos++];
         bool v6 = (tag & kCandV6) != 0;
         Candidate c{(uint8_t)(tag & 0x7F), 0, 0};
         if (c.type > 1) return OFFER_FORMAT;
         size_t alen = v6 ? 16 : 4;
-        if (pos + alen + 2 > end) return OFFER_FORMAT;
+        if (pos + alen + 2 > body) return OFFER_FORMAT;
         if (v6) {
             c.v6 = true;
             memcpy(c.ip6.data(), p + pos, 16);
@@ -125,9 +134,9 @@ int offerDecode(const uint8_t* p, size_t n, Offer& o) {
         if (c.port == 0) return OFFER_FORMAT;
         r.cands.push_back(c);
     }
-    if (pos + 1 > end) return OFFER_FORMAT;
+    if (pos + 1 > body) return OFFER_FORMAT;
     size_t n6 = p[pos++];
-    if (n6 > kMaxV6 || pos + n6 * 16 + 2 != end) return OFFER_FORMAT;
+    if (n6 > kMaxV6 || pos + n6 * 16 + 2 != body) return OFFER_FORMAT;
     for (size_t i = 0; i < n6; i++) {
         Ip6 a;
         memcpy(a.data(), p + pos, 16);
@@ -136,6 +145,14 @@ int offerDecode(const uint8_t* p, size_t n, Offer& o) {
     }
     r.port6 = be16(p + pos);
     pos += 2;
+    if (grp) {
+        r.group = true;
+        memcpy(r.gsecret, p + pos, 32);
+        pos += 32;
+        r.gthird = p[pos++];
+        r.gmax = p[pos++];
+        if (r.gthird == 0 || r.gthird == 255 || r.gmax < 2 || r.gmax > 8) return OFFER_FORMAT;
+    }
     uint8_t chk[4];
     crypto::blake2s(chk, 4, nullptr, 0, p, pos);
     if (!crypto::ctEqual(chk, p + pos, 4)) return OFFER_CHECKSUM;
@@ -147,11 +164,47 @@ int offerDecode(const uint8_t* p, size_t n, Offer& o) {
     r.cands = keep;
     if (offerCandidates(r).empty()) return OFFER_NO_CANDIDATES;
     r.name = sanitize(r.name, kMaxName);
+    r.version = p[0];
     o = r;
     return OFFER_OK;
 }
 
 static uint32_t A(uint32_t a, uint32_t b, uint32_t c, uint32_t d) { return (a << 24) | (b << 16) | (c << 8) | d; }
+
+bool aliasUsable4(uint32_t ip, const Offer& installer, uint32_t net) {
+    // A real address is mirrored through the tunnel unless it could be confused with something on the side that
+    // installs the route: it must differ from every host address of that side, and inside a network shared with that
+    // side it must not look like a gateway or a broadcast address (.0, .1, .254, .255). The Android side additionally
+    // drops addresses that are its actual gateway or DNS server.
+    uint32_t a = ip >> 24;
+    if (a == 0 || a == 127 || a >= 224) return false;
+    if ((ip >> 16) == ((169u << 8) | 254u)) return false;
+    if ((ip & 0xFFFFFF00u) == net) return false;
+    uint32_t last = ip & 0xFFu;
+    if (last == 0 || last == 255) return false;
+    for (const Candidate& c : installer.cands) {
+        if (c.type != 0 || c.v6) continue;
+        if (c.ip == ip) return false;
+        if ((c.ip >> 8) == (ip >> 8) && (last == 1 || last == 254)) return false;
+    }
+    return true;
+}
+
+bool aliasUsable6(const Ip6& a, const Offer& installer, const Ip6& net6) {
+    // A real IPv6 address is mirrored under the same conditions as an IPv4 one: it must be a global or unique-local
+    // unicast address, outside the virtual /64, different from every address of the side that installs the route,
+    // and in a network shared with that side it must not look like a router (interface id 0 .. 0xff).
+    if (ip6IsUnspecified(a) || ip6IsLoopback(a) || ip6IsLinkLocal(a) || ip6IsMulticast(a) || ip6IsV4Mapped(a))
+        return false;
+    if (ip6SamePrefix64(a, net6)) return false;
+    bool lowIid = true;
+    for (size_t i = 8; i < 15; i++) lowIid &= a[i] == 0;
+    for (const Ip6& b : installer.v6) {
+        if (a == b) return false;
+        if (ip6SamePrefix64(a, b) && lowIid) return false;
+    }
+    return true;
+}
 
 Layout computeLayout(const Offer& mine, const Offer& peer) {
     const uint32_t nets[] = {A(192, 168, 77, 0), A(192, 168, 177, 0), A(192, 168, 217, 0), A(10, 77, 77, 0),
@@ -183,24 +236,7 @@ Layout computeLayout(const Offer& mine, const Offer& peer) {
     l.myIp = chosen | (l.initiator ? 1u : 2u);
     l.peerIp = chosen | (l.initiator ? 2u : 1u);
 
-    // A real address is mirrored through the tunnel unless it could be confused with something on the side that
-    // installs the route: it must differ from every host address of that side, and inside a network shared with that
-    // side it must not look like a gateway or a broadcast address (.0, .1, .254, .255). The Android side additionally
-    // drops addresses that are its actual gateway or DNS server.
-    auto aliasOk = [&](uint32_t ip, const Offer& installer) {
-        uint32_t a = ip >> 24;
-        if (a == 0 || a == 127 || a >= 224) return false;
-        if ((ip >> 16) == ((169u << 8) | 254u)) return false;
-        if ((ip & 0xFFFFFF00u) == l.net) return false;
-        uint32_t last = ip & 0xFFu;
-        if (last == 0 || last == 255) return false;
-        for (const Candidate& c : installer.cands) {
-            if (c.type != 0 || c.v6) continue;
-            if (c.ip == ip) return false;
-            if ((c.ip >> 8) == (ip >> 8) && (last == 1 || last == 254)) return false;
-        }
-        return true;
-    };
+    auto aliasOk = [&](uint32_t ip, const Offer& installer) { return aliasUsable4(ip, installer, l.net); };
     auto collect = [&](const Offer& from, const Offer& installer, std::vector<uint32_t>& out) {
         for (const Candidate& c : from.cands) {
             if (c.type != 0 || c.v6 || out.size() >= 4) continue;
@@ -233,21 +269,7 @@ Layout computeLayout(const Offer& mine, const Offer& peer) {
         l.peerIp6[15] = l.initiator ? 2 : 1;
         l.prefix6 = 64;
     }
-    // A real IPv6 address is mirrored under the same conditions as an IPv4 one: it must be a global or unique-local
-    // unicast address, outside the virtual /64, different from every address of the side that installs the route,
-    // and in a network shared with that side it must not look like a router (interface id 0 .. 0xff).
-    auto aliasOk6 = [&](const Ip6& a, const Offer& installer) {
-        if (ip6IsUnspecified(a) || ip6IsLoopback(a) || ip6IsLinkLocal(a) || ip6IsMulticast(a) || ip6IsV4Mapped(a))
-            return false;
-        if (ip6SamePrefix64(a, l.net6)) return false;
-        bool lowIid = true;
-        for (size_t i = 8; i < 15; i++) lowIid &= a[i] == 0;
-        for (const Ip6& b : installer.v6) {
-            if (a == b) return false;
-            if (ip6SamePrefix64(a, b) && lowIid) return false;
-        }
-        return true;
-    };
+    auto aliasOk6 = [&](const Ip6& a, const Offer& installer) { return aliasUsable6(a, installer, l.net6); };
     auto collect6 = [&](const Offer& from, const Offer& installer, std::vector<Ip6>& out) {
         for (const Ip6& a : from.v6) {
             if (out.size() >= 3 || !aliasOk6(a, installer)) continue;
