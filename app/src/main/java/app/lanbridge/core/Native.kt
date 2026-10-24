@@ -1,7 +1,7 @@
 package app.lanbridge.core
 
 /**
- * JNI bridge to liblanbridge.so (C++ core). Text always crosses the boundary as UTF-8 bytes.
+ * JNI bridge to the C++ core (liblanbridge.so on Android, lanbridge.dll on Windows). Text always crosses the boundary as UTF-8 bytes.
  *
  * Status array layout (LongArray, 32 fields; older builds of the core returned 23):
  *  0 state  1 rxBytes  2 txBytes  3 rxPkts  4 txPkts  5 rttMs(-1)  6 sinceRxMs(-1)  7 connectedSec  8 pathLocal(-1/0/1)
@@ -18,7 +18,7 @@ package app.lanbridge.core
  */
 object Native {
     init {
-        System.loadLibrary("lanbridge")
+        NativeLib.load()
     }
 
     // ---- direct connection of two devices

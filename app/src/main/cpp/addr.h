@@ -1,13 +1,11 @@
 // LanBridge native core: a UDP endpoint of either family (the tunnel's outer transport runs over IPv4 and IPv6).
 #pragma once
 
-#include <netinet/in.h>
-#include <sys/socket.h>
-
 #include <cstdint>
 #include <string>
 
 #include "ipv6.h"
+#include "plat.h"
 
 namespace lb {
 

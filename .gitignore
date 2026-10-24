@@ -10,3 +10,6 @@ captures/
 *.apk
 *.aab
 !keystore/
+desktop/resources/windows-x64/*.dll
+desktop/resources/windows-x64/wintun-LICENSE.txt
+build-win/

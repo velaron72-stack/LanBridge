@@ -83,7 +83,7 @@ bool Impl::wouldBlock(int e) const { return e == EAGAIN || e == EWOULDBLOCK || e
 void Impl::noteTxError(const Addr& to, int e) {
     (to.v6 ? txErr6 : txErr4)++;
     int& last = lastTxErrno[to.v6 ? 1 : 0];
-    if (last != e) LBLOG("отправка на %s: %s", addrStr(to).c_str(), strerror(e));
+    if (last != e) LBLOG("отправка на %s: %s", addrStr(to).c_str(), plat::errStr(e).c_str());
     last = e;
 }
 

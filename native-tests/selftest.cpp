@@ -1,13 +1,5 @@
 // LanBridge native self-test: crypto known answers, protocol units, and a two-engine loopback integration run.
 // Build and run with ./run.sh (uses ASAN + UBSAN).
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -22,6 +14,7 @@
 #include "frag.h"
 #include "ipv6.h"
 #include "offer.h"
+#include "plat.h"
 #include "protocol.h"
 #include "stun.h"
 #include "util.h"
@@ -48,7 +41,7 @@ static void hexTo(const char* s, uint8_t* o) {
     }
 }
 static std::string H(const uint8_t* p, size_t n) { return hexStr(p, n); }
-static void sleepMs(int ms) { usleep((useconds_t)ms * 1000); }
+static void sleepMs(int ms) { plat::sleepMs(ms); }
 static bool waitFor(const std::function<bool()>& f, int timeoutMs) {
     uint64_t end = nowMs() + (uint64_t)timeoutMs;
     while (nowMs() < end) {
@@ -961,7 +954,7 @@ struct MockStun {
     std::atomic<bool> run{true};
     std::thread th;
     explicit MockStun(int portShift) : shift(portShift) {
-        fd = socket(AF_INET, SOCK_DGRAM, 0);
+        fd = plat::openUdp(AF_INET);
         sockaddr_in a;
         memset(&a, 0, sizeof a);
         a.sin_family = AF_INET;
@@ -972,12 +965,12 @@ struct MockStun {
         port = ntohs(a.sin_port);
         th = std::thread([this] {
             while (run) {
-                pollfd pf{fd, POLLIN, 0};
-                if (poll(&pf, 1, 50) <= 0) continue;
+                pollfd pf = plat::pollItem(fd, POLLIN);
+                if (plat::pollFds(&pf, 1, 50) <= 0) continue;
                 uint8_t b[600];
                 sockaddr_in from;
                 socklen_t fl = sizeof from;
-                ssize_t n = recvfrom(fd, b, sizeof b, 0, (sockaddr*)&from, &fl);
+                ssize_t n = plat::recvFrom(fd, b, sizeof b, (sockaddr*)&from, &fl);
                 if (n < 20 || be16(b) != 0x0001) continue;
                 uint8_t r[32];
                 putBe16(r, 0x0101);
@@ -990,14 +983,14 @@ struct MockStun {
                 r[25] = 1;
                 putBe16(r + 26, (uint16_t)((ntohs(from.sin_port) + shift) ^ 0x2112));
                 putBe32(r + 28, ntohl(from.sin_addr.s_addr) ^ 0x2112A442u);
-                sendto(fd, r, sizeof r, 0, (sockaddr*)&from, fl);
+                plat::sendTo(fd, r, sizeof r, (sockaddr*)&from, fl);
             }
         });
     }
     ~MockStun() {
         run = false;
         th.join();
-        close(fd);
+        plat::closeFd(fd);
     }
     std::string addr() const { return strfmt("127.0.0.1:%u", (unsigned)port); }
 };
@@ -1051,18 +1044,17 @@ struct FakeTun {
 };
 static FakeTun mkTun() {
     int sv[2];
-    socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
-    fcntl(sv[1], F_SETFL, fcntl(sv[1], F_GETFL, 0) | O_NONBLOCK);
+    if (!plat::datagramPair(sv, 1 << 20)) abort();
     FakeTun t;
     t.engineFd = sv[0];
     t.testFd = sv[1];
     return t;
 }
 static bool readPkt(int fd, std::vector<uint8_t>& out, int timeoutMs) {
-    pollfd pf{fd, POLLIN, 0};
-    if (poll(&pf, 1, timeoutMs) <= 0) return false;
+    pollfd pf = plat::pollItem(fd, POLLIN);
+    if (plat::pollFds(&pf, 1, timeoutMs) <= 0) return false;
     uint8_t b[4096];
-    ssize_t n = recv(fd, b, sizeof b, 0);
+    ssize_t n = plat::fdRead(fd, b, sizeof b);
     if (n <= 0) return false;
     out.assign(b, b + n);
     return true;
@@ -1123,7 +1115,7 @@ static bool setupPair(Node& A, Node& B, const Config& cfg, int delayB, const cha
     return ok;
 }
 
-static void sendTun(Node& n, const std::vector<uint8_t>& p) { (void)!write(n.tun.testFd, p.data(), p.size()); }
+static void sendTun(Node& n, const std::vector<uint8_t>& p) { (void)!plat::fdWrite(n.tun.testFd, p.data(), p.size()); }
 
 static void testEngine(int round) {
     printf("[engine] round %d\n", round);
@@ -1180,7 +1172,7 @@ static void testEngine(int round) {
 
     // garbage from the outside must not disturb the tunnel (ASAN/UBSAN watch this)
     {
-        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        int s = plat::openUdp(AF_INET);
         sockaddr_in to;
         memset(&to, 0, sizeof to);
         to.sin_family = AF_INET;
@@ -1193,9 +1185,9 @@ static void testEngine(int round) {
             g[0] = types[g[1] % sizeof types];
             size_t len = 1 + (g[2] | (g[3] << 8)) % 1400;
             if (i % 5 == 0) len = (i % 3 == 0) ? MSG1_LEN : (i % 3 == 1) ? MSG2_LEN : PUNCH_LEN;
-            sendto(s, g, len, 0, (sockaddr*)&to, sizeof to);
+            plat::sendTo(s, g, len, (sockaddr*)&to, sizeof to);
         }
-        close(s);
+        plat::closeFd(s);
     }
     auto after = mkUdp(la.myIp, la.peerIp, 9, 9, "still alive");
     sendTun(A, after);
@@ -1717,6 +1709,12 @@ int main(int argc, char** argv) {
     if (argc > 1 && !strcmp(argv[1], "groups")) {  // only the group tests (quicker while working on them); optional: one scenario
         if (argc > 2) g_onlyGroupTest = argv[2];
         testGroups();
+        printf("\nresult: %d checks passed, %d failed\n", g_pass, g_fail);
+        if (g_fail) printf("--- engine log ---\n%s\n", logDump().c_str());
+        return g_fail ? 1 : 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "engine")) {  // one round of the two-device test: selftest engine [round]
+        testEngine(argc > 2 ? atoi(argv[2]) : 0);
         printf("\nresult: %d checks passed, %d failed\n", g_pass, g_fail);
         if (g_fail) printf("--- engine log ---\n%s\n", logDump().c_str());
         return g_fail ? 1 : 0;

@@ -606,7 +606,7 @@ static void testGroupApi() {
     CHECK(j.n.e.start(t.engineFd, 1500) != 0);  // not admitted (the descriptor is closed by the engine)
     CHECK(waitFor([&] { return j.n.field(27) == 3; }, 6000));
     CHECK(has(j.n.e.lastError(), "не отвечает"));
-    close(t.testFd);
+    plat::closeFd(t.testFd);
     // prepare() again resets that state; this time the creator is there
     L.cfg.joinTimeoutMs = 8000;
     CHECK(L.join(j, L.code) == OFFER_OK && L.admitted(j) && L.startTun(j));
@@ -1043,7 +1043,7 @@ static void testGroupTunSwap() {
     FakeTun t2 = mkTun();
     int oldTest = a.n.tun.testFd;
     CHECK(a.n.e.swapTun(t2.engineFd) == 0);
-    close(oldTest);
+    plat::closeFd(oldTest);
     a.n.tun = t2;
     CHECK(a.n.field(23) == ver);
     CHECK(L.allPairs(pair));
@@ -1073,7 +1073,7 @@ static void testGroupTunSwap() {
     CHECK(readPkt(b.n.tun.testFd, got, 3000) && got == r3 && !readPkt(c.n.tun.testFd, got, 150));
     // the swap of the TUN of the creator while members are connected
     FakeTun t3 = mkTun();
-    close(c.n.tun.testFd);
+    plat::closeFd(c.n.tun.testFd);
     CHECK(c.n.e.swapTun(t3.engineFd) == 0);
     c.n.tun = t3;
     CHECK(L.allPairs(all));

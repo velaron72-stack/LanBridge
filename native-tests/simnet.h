@@ -12,14 +12,9 @@
 //  * STUN servers (Binding responses with XOR-MAPPED-ADDRESS of either family).
 #pragma once
 
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <atomic>
 #include <cerrno>
 #include <cstring>
-#include <fcntl.h>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -28,6 +23,7 @@
 #include <vector>
 
 #include "addr.h"
+#include "plat.h"
 #include "udpio.h"
 #include "util.h"
 
@@ -161,13 +157,9 @@ private:
 
 inline Sock::Sock(Net& net, Host& host, bool v6) : net_(net), host_(host), v6_(v6) {
     int sv[2];
-    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0) abort();
+    if (!plat::datagramPair(sv, 1 << 20)) abort();
     rd_ = sv[0];
     wr_ = sv[1];
-    for (int fd : {rd_, wr_}) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-    int buf = 1 << 20;
-    setsockopt(wr_, SOL_SOCKET, SO_SNDBUF, &buf, sizeof buf);
-    setsockopt(rd_, SOL_SOCKET, SO_RCVBUF, &buf, sizeof buf);
     port_ = net.nextPort++;
     std::lock_guard<std::mutex> g(net_.mu);
     net_.byExt[lb::addrStr(ext())] = this;
@@ -179,8 +171,8 @@ inline Sock::~Sock() {
         auto it = net_.byExt.find(lb::addrStr(ext()));
         if (it != net_.byExt.end() && it->second == this) net_.byExt.erase(it);
     }
-    close(rd_);
-    close(wr_);
+    plat::closeFd(rd_);
+    plat::closeFd(wr_);
 }
 
 inline Addr Sock::ext() const {
@@ -210,13 +202,13 @@ inline void Sock::push(const Addr& from, const uint8_t* b, size_t n) {
     lb::putBe32(&m[17], from.ip4);
     lb::putBe16(&m[21], from.port);
     if (n) memcpy(&m[23], b, n);
-    ssize_t r = send(wr_, m.data(), m.size(), MSG_DONTWAIT);
+    ssize_t r = plat::fdWrite(wr_, m.data(), m.size());
     (void)r;  // a full queue drops the datagram, like a real socket buffer
 }
 
 inline ssize_t Sock::recvFrom(uint8_t* b, size_t cap, Addr& from) {
     uint8_t tmp[4000];
-    ssize_t n = recv(rd_, tmp, sizeof tmp, MSG_DONTWAIT);
+    ssize_t n = plat::fdRead(rd_, tmp, sizeof tmp);
     if (n < 0) return -1;
     if (n < 23) return 0;
     from = Addr();

@@ -3,7 +3,6 @@
 // Included by selftest.cpp; uses its helpers (CHECK, Node, mkTun, readPkt, mkUdp, mkUdp6, A6, waitFor, ...).
 #pragma once
 
-#include <sys/un.h>
 
 #include "addr.h"
 #include "simnet.h"
@@ -43,10 +42,10 @@ static void testAddr() {
     CHECK(addrFromSock((const sockaddr*)&m, sizeof m, back) && back == addr4(t4(10, 1, 2, 3), 9));
     CHECK(!addrFromSock((const sockaddr*)&m, sizeof(sockaddr_in6) - 1, back));   // truncated
     CHECK(!addrFromSock((const sockaddr*)&s4, sizeof(sockaddr_in) - 1, back));
-    sockaddr_un un;
-    memset(&un, 0, sizeof un);
-    un.sun_family = AF_UNIX;
-    CHECK(!addrFromSock((const sockaddr*)&un, sizeof un, back));                  // another family
+    sockaddr_storage other;
+    memset(&other, 0, sizeof other);
+    other.ss_family = 1;  // AF_UNIX on both systems
+    CHECK(!addrFromSock((const sockaddr*)&other, sizeof other, back));            // another family
     CHECK(!addrFromSock(nullptr, 16, back));
 
     // networks that are local to the device or the LAN

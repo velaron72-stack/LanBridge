@@ -2,9 +2,9 @@ package app.lanbridge.core
 
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import android.os.SystemClock
 import app.lanbridge.ui.Fmt
+import app.lanbridge.ui.SysActions
 import app.lanbridge.vpn.TunnelVpnService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -176,7 +176,7 @@ object TunnelController {
         prefs = Prefs(appCtx)
         _ui.update { it.copy(mode = if (prefs.groupMode) Mode.GROUP else Mode.DIRECT) }
         try {
-            Native.note("LanBridge запущен: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}")
+            Native.note("LanBridge запущен: ${SysActions.platformLabel()}")
         } catch (t: Throwable) {
             nativeError = t.message ?: t.javaClass.simpleName
             _ui.update { it.copy(error = "Нативная библиотека не загрузилась: $nativeError") }

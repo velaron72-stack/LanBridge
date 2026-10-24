@@ -1,4 +1,4 @@
-name: Build APK
+name: Build (APK + PC)
 
 on:
   push:
@@ -70,3 +70,175 @@ jobs:
         run: bash native-tests/run.sh
       - name: Run real-kernel traffic test (TUN devices in network namespaces)
         run: sudo env "PATH=$PATH" python3 native-tests/nettest.py all
+
+  pc-native:
+    name: PC native library (lanbridge.dll)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LLVM_MINGW_TAG: "20241030"
+      LLVM_MINGW_NAME: llvm-mingw-20241030-ucrt-ubuntu-20.04-x86_64
+      LLVM_MINGW_SHA256: 05c55108e9b400bda1d4cef8e22c0e5f9495f1316c072e92b9f7965114a30b66
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (JNI headers)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install llvm-mingw (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build
+          curl -fsSL -o "$RUNNER_TEMP/llvm-mingw.tar.xz" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_TAG}/${LLVM_MINGW_NAME}.tar.xz"
+          echo "${LLVM_MINGW_SHA256}  $RUNNER_TEMP/llvm-mingw.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/llvm-mingw.tar.xz" -C "$RUNNER_TEMP"
+          echo "LLVM_MINGW=$RUNNER_TEMP/${LLVM_MINGW_NAME}" >> "$GITHUB_ENV"
+
+      - name: Build lanbridge.dll
+        run: |
+          set -euo pipefail
+          cmake -S app/src/main/cpp -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/app/src/main/cpp/toolchain-mingw-x64.cmake" -DLLVM_MINGW="$LLVM_MINGW"
+          cmake --build build-win
+          "$LLVM_MINGW/bin/llvm-strip" --strip-unneeded build-win/lanbridge.dll
+          ls -l build-win/lanbridge.dll
+
+      - name: Check the library (exports, dependencies)
+        run: |
+          set -euo pipefail
+          OBJDUMP="$LLVM_MINGW/bin/llvm-objdump"
+          "$OBJDUMP" -p build-win/lanbridge.dll > build-win/pe.txt
+          grep -E "DLL Name" build-win/pe.txt | sort -u
+          # every external fun of Native.kt and WinTun.kt must be exported
+          want=$(cat app/src/main/java/app/lanbridge/core/Native.kt desktop/src/main/kotlin/app/lanbridge/core/WinTun.kt | grep -c "external fun")
+          have=$(grep -c "Java_app_lanbridge_core_" build-win/pe.txt || true)
+          echo "JNI exports: have=$have want=$want"
+          test "$have" -ge "$want"
+          # a static build: only Windows system libraries may be imported
+          if grep -iE "DLL Name: (libc\+\+|libunwind|libwinpthread|libgcc|libstdc\+\+)" build-win/pe.txt; then
+            echo "lanbridge.dll depends on a runtime library that is not shipped"; exit 1
+          fi
+
+      - name: Upload lanbridge.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: lanbridge-dll
+          path: build-win/lanbridge.dll
+          if-no-files-found: error
+
+      - name: Core tests under Wine (non-blocking)
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y -qq wine64 || sudo apt-get install -y -qq wine
+          export WINEPREFIX="$RUNNER_TEMP/wineprefix" WINEDEBUG=-all
+          export WINE="$(command -v wine64 || command -v wine || echo /usr/lib/wine/wine64)"
+          bash native-tests/run-win.sh all
+
+  pc-app:
+    name: PC app (Windows 10/11 x64)
+    needs: pc-native
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Get lanbridge.dll
+        uses: actions/download-artifact@v4
+        with:
+          name: lanbridge-dll
+          path: desktop/resources/windows-x64
+
+      - name: Get Wintun 0.14.1 (the signature must be WireGuard LLC)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP 'wintun.zip'
+          Invoke-WebRequest -Uri 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile $zip
+          Write-Host ('wintun-0.14.1.zip sha256: ' + (Get-FileHash $zip -Algorithm SHA256).Hash)
+          $dir = Join-Path $env:RUNNER_TEMP 'wintun'
+          Expand-Archive $zip -DestinationPath $dir
+          $dll = Join-Path $dir 'wintun\bin\amd64\wintun.dll'
+          $sig = Get-AuthenticodeSignature $dll
+          Write-Host ('signature: ' + $sig.Status + ', ' + $sig.SignerCertificate.Subject)
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'WireGuard LLC') {
+            throw 'wintun.dll: signature is not a valid WireGuard LLC signature'
+          }
+          Copy-Item $dll 'desktop\resources\windows-x64\wintun.dll'
+          Copy-Item (Join-Path $dir 'wintun\LICENSE.txt') 'desktop\resources\windows-x64\wintun-LICENSE.txt'
+          Get-ChildItem 'desktop\resources\windows-x64'
+
+      - name: Build the app image
+        working-directory: desktop
+        run: gradle checkNativeFiles createDistributable --no-daemon --stacktrace
+
+      - name: Both libraries must be inside the app image
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'desktop\build\compose\binaries\main\app\LanBridge'
+          foreach ($n in 'LanBridge.exe', 'lanbridge.dll', 'wintun.dll') {
+            $f = Get-ChildItem $root -Recurse -Filter $n | Select-Object -First 1
+            if (-not $f) { throw "$n is not in $root" }
+            Write-Host ("$n -> " + $f.FullName)
+          }
+
+      - name: Smoke test of the packaged app (libraries load, engine answers)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'desktop\build\compose\binaries\main\app\LanBridge\LanBridge.exe'
+          $out = Join-Path $env:RUNNER_TEMP 'check.txt'
+          $p = Start-Process $exe -ArgumentList '--check', '--check-out', $out -Wait -PassThru
+          if (Test-Path $out) { Get-Content $out } else { Write-Host 'no report written' }
+          if ($p.ExitCode -ne 0) { throw ('smoke test failed, exit code ' + $p.ExitCode) }
+
+      - name: Wintun adapter test on the runner (non-blocking)
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'desktop\build\compose\binaries\main\app\LanBridge\LanBridge.exe'
+          $out = Join-Path $env:RUNNER_TEMP 'check-adapter.txt'
+          $p = Start-Process $exe -ArgumentList '--check', '--check-adapter', '--check-out', $out -Wait -PassThru
+          if (Test-Path $out) { Get-Content $out } else { Write-Host 'no report written' }
+          if ($p.ExitCode -ne 0) { throw ('adapter test failed, exit code ' + $p.ExitCode) }
+
+      - name: Portable ZIP
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Compress-Archive -Path 'desktop\build\compose\binaries\main\app\LanBridge' -DestinationPath 'LanBridge-PC-portable.zip'
+          Get-Item 'LanBridge-PC-portable.zip' | Select-Object Name, Length
+
+      - name: Upload portable build
+        uses: actions/upload-artifact@v4
+        with:
+          name: LanBridge-PC-portable
+          path: LanBridge-PC-portable.zip
+          if-no-files-found: error
+
+      - name: Build the installer (non-blocking, needs WiX on the runner)
+        continue-on-error: true
+        working-directory: desktop
+        run: gradle packageExe --no-daemon --stacktrace
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: LanBridge-PC-installer
+          path: desktop/build/compose/binaries/main/exe/*.exe
+          if-no-files-found: ignore

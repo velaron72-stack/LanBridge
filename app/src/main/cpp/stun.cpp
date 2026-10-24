@@ -1,11 +1,6 @@
 #include "stun.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
-#include <netdb.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <sys/types.h>
 
 #include <algorithm>
 #include <condition_variable>
@@ -14,6 +9,7 @@
 #include <mutex>
 #include <thread>
 
+#include "plat.h"
 #include "util.h"
 
 namespace lb {
@@ -56,6 +52,7 @@ bool stunResolve(const std::string& hostPort, std::vector<Addr>& out) {
         out.push_back(addr6(a6, pt));
         return true;
     }
+    plat::init();
     addrinfo hints;
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
@@ -251,14 +248,14 @@ int stunGather(UdpSocket* s4, UdpSocket* s6, std::vector<StunServer>& sv, int ti
         int np = 0;
         UdpSocket* socks[2] = {nullptr, nullptr};
         if (s4) {
-            pfd[np] = pollfd{s4->fd(), POLLIN, 0};
+            pfd[np] = plat::pollItem(s4->fd(), POLLIN);
             socks[np++] = s4;
         }
         if (s6) {
-            pfd[np] = pollfd{s6->fd(), POLLIN, 0};
+            pfd[np] = plat::pollItem(s6->fd(), POLLIN);
             socks[np++] = s6;
         }
-        int r = poll(pfd, (nfds_t)np, wait);
+        int r = plat::pollFds(pfd, np, wait);
         if (r <= 0) continue;
         for (int k = 0; k < np; k++) {
             if (!(pfd[k].revents & POLLIN)) continue;

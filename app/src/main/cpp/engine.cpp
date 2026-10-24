@@ -1,9 +1,6 @@
 // LanBridge native core: engine, lifecycle, main loop and the public API. The work itself is in engine_net.cpp (sessions,
 // handshakes, datagrams), engine_group.cpp (peers, groups, relay, profiles) and engine_tun.cpp (TUN side, flows).
 #include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <cstring>
@@ -39,14 +36,14 @@ void Impl::setState(int s) {
 void Impl::wake() {
     if (wakeFd[1] >= 0) {
         uint8_t b = 1;
-        ssize_t r = write(wakeFd[1], &b, 1);
+        ssize_t r = plat::fdWrite(wakeFd[1], &b, 1);
         (void)r;
     }
 }
 
 void Impl::drainWake() {
     uint8_t b[64];
-    while (read(wakeFd[0], b, sizeof b) > 0) {
+    while (plat::fdRead(wakeFd[0], b, sizeof b) > 0) {
     }
 }
 
@@ -73,16 +70,12 @@ bool Impl::openSocketLocked() {
         return false;
     }
     if (wakeFd[0] < 0) {
-        if (pipe(wakeFd) < 0) {
-            lastErr = strfmt("pipe: %s", strerror(errno));
+        if (!plat::makeWake(wakeFd)) {
+            lastErr = strfmt("wake: %s", plat::errStr(plat::sockErrno()).c_str());
             wakeFd[0] = wakeFd[1] = -1;
             s4.reset();
             s6.reset();
             return false;
-        }
-        for (int i = 0; i < 2; i++) {
-            fcntl(wakeFd[i], F_SETFL, fcntl(wakeFd[i], F_GETFL, 0) | O_NONBLOCK);
-            fcntl(wakeFd[i], F_SETFD, FD_CLOEXEC);
         }
     }
     return true;
@@ -97,7 +90,7 @@ void Impl::resetFragStatsLocked() {
 
 void Impl::closeTunLocked() {
     if (tunFd >= 0) {
-        close(tunFd);
+        plat::closeFd(tunFd);
         tunFd = -1;
     }
 }
@@ -244,21 +237,21 @@ void Impl::loop() {
         }
         pollfd fds[4];
         int nf = 0, ti = -1, i4 = -1, i6 = -1;
-        fds[nf++] = pollfd{wakeFd[0], POLLIN, 0};
+        fds[nf++] = plat::pollItem(wakeFd[0], POLLIN);
         if (fd4 >= 0) {
             i4 = nf;
-            fds[nf++] = pollfd{fd4, (short)(POLLIN | (out4 ? POLLOUT : 0)), 0};
+            fds[nf++] = plat::pollItem(fd4, (short)(POLLIN | (out4 ? POLLOUT : 0)));
         }
         if (fd6 >= 0) {
             i6 = nf;
-            fds[nf++] = pollfd{fd6, (short)(POLLIN | (out6 ? POLLOUT : 0)), 0};
+            fds[nf++] = plat::pollItem(fd6, (short)(POLLIN | (out6 ? POLLOUT : 0)));
         }
         if (tfd >= 0) {
             ti = nf;
-            fds[nf++] = pollfd{tfd, POLLIN, 0};
+            fds[nf++] = plat::pollItem(tfd, POLLIN);
         }
-        int r = poll(fds, (nfds_t)nf, timeout);
-        if (r < 0 && errno != EINTR) usleep(10000);
+        int r = plat::pollFds(fds, nf, timeout);
+        if (r < 0 && errno != EINTR) plat::sleepMs(10);
         std::lock_guard<std::mutex> g(mu);
         if (!running.load()) break;
         uint64_t now = nowMs();
@@ -655,7 +648,7 @@ int Engine::start(int tunFd, int mtu) {
     Impl& s = *p_;
     std::lock_guard<std::mutex> g(s.mu);
     auto fail = [&](int code, const char* msg) {
-        if (tunFd >= 0) close(tunFd);
+        if (tunFd >= 0) plat::closeFd(tunFd);
         s.lastErr = msg;
         LBLOG("старт отклонён: %s", msg);
         return code;
@@ -670,8 +663,7 @@ int Engine::start(int tunFd, int mtu) {
         if (offerExpired(s.peers[0]->offer)) return fail(3, "код друга истёк");
     }
     if (tunFd < 0) return fail(4, "нет TUN-интерфейса");
-    int fl = fcntl(tunFd, F_GETFL, 0);
-    fcntl(tunFd, F_SETFL, fl | O_NONBLOCK);
+    plat::setNonBlocking(tunFd);
 
     uint64_t now = nowMs();
     if (!group) {
@@ -723,14 +715,13 @@ int Engine::swapTun(int newFd) {
     int st = s.state.load();
     if (newFd < 0) return 1;
     if (s.tunFd < 0 || !(st >= ST_CONNECTING && st <= ST_STALLED)) {
-        close(newFd);
+        plat::closeFd(newFd);
         return 1;
     }
-    int fl = fcntl(newFd, F_GETFL, 0);
-    fcntl(newFd, F_SETFL, fl | O_NONBLOCK);
+    plat::setNonBlocking(newFd);
     int old = s.tunFd;
     s.tunFd = newFd;
-    close(old);
+    plat::closeFd(old);
     s.udpAssoc.clear();
     s.fragFix.clear();
     for (auto& p : s.peers) p->reasm.clear();
@@ -758,17 +749,23 @@ void Engine::retry() {
 
 void Engine::stopInternal() {
     Impl& s = *p_;
+    // The thread stops first: after that nothing else is sent to the peers, so the goodbye is the last datagram they
+    // get. (Said while the thread still ran, a pong answering a late ping could follow it and mark the peer as present
+    // again for a moment.)
+    s.stopThread();
     {
         std::lock_guard<std::mutex> g(s.mu);
-        if (s.engineActive() && s.haveSocket()) s.sendBye(nowMs());
+        if (s.engineActive() && s.haveSocket()) {
+            s.sendBye(nowMs());
+            s.flushOut();  // nobody flushes the queue any more
+        }
     }
-    s.stopThread();
     std::lock_guard<std::mutex> g(s.mu);
     s.resetRuntimeLocked();
     s.s4.reset();
     s.s6.reset();
     for (int i = 0; i < 2; i++) {
-        if (s.wakeFd[i] >= 0) close(s.wakeFd[i]);
+        if (s.wakeFd[i] >= 0) plat::closeFd(s.wakeFd[i]);
         s.wakeFd[i] = -1;
     }
     crypto::wipe(&s.kp, sizeof s.kp);

@@ -6,10 +6,14 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 
 object SysActions {
+    /** "Xiaomi M2102J20SG, Android 14": the device as the log shows it. */
+    fun platformLabel(): String = "${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}"
+
     /** "06.10 13:05": when this build was installed, to tell new and old builds apart. */
     @Suppress("DEPRECATION")
     fun installedAt(ctx: Context): String = try {

@@ -1,10 +1,9 @@
 #include "ipv6.h"
 
-#include <arpa/inet.h>
-
 #include <cstdio>
 #include <cstring>
 
+#include "plat.h"
 #include "util.h"
 
 namespace lb {

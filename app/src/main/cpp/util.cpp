@@ -1,9 +1,9 @@
 #include "util.h"
 
-#include <fcntl.h>
 #include <time.h>
-#include <unistd.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -15,7 +15,43 @@
 #include <android/log.h>
 #endif
 
+#ifdef _WIN32
+#include "plat.h"
+#include <bcrypt.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace lb {
+
+#ifdef _WIN32
+
+uint64_t nowMs() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+uint64_t wallMs() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+void randomBytes(void* p, size_t n) {
+    uint8_t* out = (uint8_t*)p;
+    size_t done = 0;
+    while (done < n) {
+        ULONG chunk = (ULONG)std::min<size_t>(n - done, 1u << 20);
+        if (BCryptGenRandom(nullptr, out + done, chunk, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) break;
+        done += chunk;
+    }
+    if (done < n) {  // last resort, should never happen
+        std::random_device rd;
+        while (done < n) out[done++] = (uint8_t)rd();
+    }
+}
+
+#else
 
 uint64_t nowMs() {
     timespec ts;
@@ -48,6 +84,8 @@ void randomBytes(void* p, size_t n) {
         while (done < n) out[done++] = (uint8_t)rd();
     }
 }
+
+#endif
 
 std::string ipStr(uint32_t ip) {
     char b[24];
@@ -133,7 +171,11 @@ void logWrite(const std::string& msg) {
     uint64_t w = wallMs();
     time_t secs = (time_t)(w / 1000);
     tm t;
+#ifdef _WIN32
+    localtime_s(&t, &secs);
+#else
     localtime_r(&secs, &t);
+#endif
     char head[32];
     snprintf(head, sizeof head, "%02d:%02d:%02d.%03d ", t.tm_hour, t.tm_min, t.tm_sec, (int)(w % 1000));
     std::string line = std::string(head) + msg;

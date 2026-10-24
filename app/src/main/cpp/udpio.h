@@ -2,8 +2,6 @@
 // interface, so tests can put another transport underneath (this is how IPv6 is tested on a host without IPv6).
 #pragma once
 
-#include <sys/types.h>
-
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -11,6 +9,7 @@
 #include <string>
 
 #include "addr.h"
+#include "plat.h"
 
 namespace lb {
 

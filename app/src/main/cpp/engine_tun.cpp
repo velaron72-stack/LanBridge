@@ -1,8 +1,6 @@
 // LanBridge native core: engine, TUN side. Packets from the TUN are routed to the right peer (or to all of them for
 // broadcast and multicast), packets from peers are checked and written to the TUN. Flow statistics for diagnostics.
 #include <errno.h>
-#include <poll.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <cstring>
@@ -224,13 +222,13 @@ void Impl::gcAssoc(uint64_t now) {
 
 // Writes one IP packet into the TUN. False when it could not be written (already counted).
 bool Impl::writeTun(const uint8_t* ip, size_t tot) {
-    ssize_t w = write(tunFd, ip, tot);
+    ssize_t w = plat::fdWrite(tunFd, ip, tot);
     if (w < 0) {
         dropped++;
         tunWriteErr++;
         if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR && errno != EINVAL && errno != EMSGSIZE &&
             errno != ENOBUFS)
-            failTunLocked(strfmt("TUN write: %s", strerror(errno)));
+            failTunLocked(strfmt("TUN write: %s", plat::errStr(errno).c_str()));
         return false;
     }
     return true;
@@ -323,10 +321,10 @@ void Impl::deliverIp6(Peer* from, const uint8_t* ip, size_t len) {
 void Impl::readTun(uint64_t now, short revents) {
     uint8_t buf[4096];
     for (int i = 0; i < 256; i++) {
-        ssize_t n = read(tunFd, buf, sizeof buf);
+        ssize_t n = plat::fdRead(tunFd, buf, sizeof buf);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) break;
-            failTunLocked(strfmt("TUN read: %s", strerror(errno)));
+            failTunLocked(strfmt("TUN read: %s", plat::errStr(errno).c_str()));
             return;
         }
         if (n == 0) {
