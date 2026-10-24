@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "util.h"
 #include "wintun_win.h"
@@ -28,6 +29,22 @@ std::wstring jw(JNIEnv* env, jstring s) {
 }
 
 std::string ju(JNIEnv* env, jstring s) { return lb::wintun::toUtf8(jw(env, s)); }
+
+// "a, b,c" -> {"a", "b", "c"}
+std::vector<std::string> splitList(const std::string& s) {
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i <= s.size()) {
+        size_t j = s.find(',', i);
+        if (j == std::string::npos) j = s.size();
+        std::string t = s.substr(i, j - i);
+        size_t a = t.find_first_not_of(" \t");
+        size_t b = t.find_last_not_of(" \t");
+        if (a != std::string::npos) out.push_back(t.substr(a, b - a + 1));
+        i = j + 1;
+    }
+    return out;
+}
 
 jstring mk(JNIEnv* env, const std::string& utf8) {
     std::wstring w = lb::wintun::fromUtf8(utf8);
@@ -79,7 +96,8 @@ JNIEXPORT jint JNICALL Java_app_lanbridge_core_WinTun_swapPair(JNIEnv*, jobject)
 }
 
 JNIEXPORT jstring JNICALL Java_app_lanbridge_core_WinTun_configure(JNIEnv* env, jobject, jstring ip4, jint prefix4,
-                                                                   jstring ip6, jint prefix6, jint mtu, jint metric) {
+                                                                   jstring ip6, jint prefix6, jint mtu, jint metric,
+                                                                   jstring alias4, jstring alias6) {
     lb::wintun::IpConfig c;
     c.ip4 = ju(env, ip4);
     c.prefix4 = (int)prefix4;
@@ -87,6 +105,8 @@ JNIEXPORT jstring JNICALL Java_app_lanbridge_core_WinTun_configure(JNIEnv* env, 
     c.prefix6 = (int)prefix6;
     c.mtu = (int)mtu;
     c.metric = (int)metric;
+    c.alias4 = splitList(ju(env, alias4));
+    c.alias6 = splitList(ju(env, alias6));
     return mk(env, lb::wintun::configure(c));
 }
 

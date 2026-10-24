@@ -20,7 +20,11 @@ object WinTun {
     external fun load(dllPath: String): String
     external fun open(name: String, guid: String): Int
     external fun swapPair(): Int
-    external fun configure(ip4: String, prefix4: Int, ip6: String, prefix6: Int, mtu: Int, metric: Int): String
+    /**
+     * Addresses, MTU and metric of the adapter, and host routes to the real addresses of the other devices
+     * ([alias4] and [alias6]: comma separated lists). The answer holds lines "E:…", "W:…" and "I:…".
+     */
+    external fun configure(ip4: String, prefix4: Int, ip6: String, prefix6: Int, mtu: Int, metric: Int, alias4: String, alias6: String): String
     external fun close()
     external fun error(): String
     external fun stats(): String

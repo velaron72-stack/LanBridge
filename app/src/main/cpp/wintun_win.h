@@ -39,10 +39,15 @@ struct IpConfig {
     int prefix6 = 64;
     int mtu = 1500;
     int metric = 1;        // interface metric (low: broadcast and multicast of games prefer this adapter)
+    // Real addresses of the other devices. Phones send with their real address as the source (it is the primary
+    // address of their tunnel), so the PC needs a host route to each of them through the adapter to answer. Addresses
+    // that belong to this PC, its gateways or DNS servers are skipped.
+    std::vector<std::string> alias4;
+    std::vector<std::string> alias6;
 };
 
-// Replaces the manually configured addresses and routes of the adapter with [c]. Returns "" when everything was set,
-// otherwise lines "E:<fatal>" or "W:<warning>" separated by '\n'.
+// Replaces the manually configured addresses and routes of the adapter with [c]. Returns lines separated by '\n':
+// "E:<fatal>", "W:<warning>" or "I:<what was done>"; "" when there is nothing to report.
 std::string configure(const IpConfig& c);
 
 // Ends the session, stops the pumps, removes the adapter if this process created it. Safe to call twice.

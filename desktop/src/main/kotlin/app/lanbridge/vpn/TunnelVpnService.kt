@@ -119,12 +119,18 @@ class TunnelVpnService {
 
         /** Gives the adapter the virtual addresses. IPv4 is required, IPv6 is a bonus: its problems are only logged. */
         private fun applyAddresses(layout: NetLayout, mtu: Int) {
-            val res = WinTun.configure(layout.my, layout.prefix, layout.my6, layout.prefix6, mtu, 1)
+            // Phones send with their real address as the source: the PC answers through the adapter only if it has
+            // a route to that address (the same mirrored addresses that the phone routes to the PC).
+            val res = WinTun.configure(
+                layout.my, layout.prefix, layout.my6, layout.prefix6, mtu, 1,
+                layout.aliasRoutes.joinToString(","), layout.aliasRoutes6.joinToString(","),
+            )
             val fatal = ArrayList<String>()
             for (line in res.lines()) {
                 when {
                     line.startsWith("E:") -> fatal.add(line.substring(2))
                     line.startsWith("W:") -> Native.note("адаптер: " + line.substring(2))
+                    line.startsWith("I:") -> Native.note("адаптер: " + line.substring(2))
                 }
             }
             if (fatal.isNotEmpty()) throw IllegalStateException(fatal.joinToString("; "))
@@ -145,8 +151,8 @@ class TunnelVpnService {
 
         /**
          * Windows blocks unsolicited inbound traffic on the profile it gives a new adapter (public). The rules let in
-         * traffic that comes from the virtual subnets only, plus the UDP of this program (the tunnel itself); the
-         * weak host model lets the PC answer packets addressed to another of its addresses through the adapter.
+         * everything that arrives through the adapter and the UDP of this program (the tunnel itself); the weak host
+         * model lets the PC answer packets addressed to another of its addresses through the adapter.
          * Best effort and off the main path: the tunnel runs without any of it, the game may not.
          */
         private fun setupNetworkAsync(layout: NetLayout) {
@@ -154,30 +160,57 @@ class TunnelVpnService {
             val t = Thread({
                 try {
                     val netsh = "\"${WinTun.system32("netsh.exe")}\""
-                    val subnets = ArrayList<String>()
-                    subnets.add("${layout.net}/${layout.prefix}")
-                    if (layout.net6.isNotEmpty()) subnets.add("${layout.net6}/${layout.prefix6}")
+                    val ps = "\"${WinTun.system32("WindowsPowerShell\\v1.0\\powershell.exe")}\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command"
+                    // Who may send to this PC through the adapter: the virtual subnets and the real addresses of the
+                    // other devices (a phone's packets carry its real address as the source).
+                    val remote = ArrayList<String>()
+                    remote.add("${layout.net}/${layout.prefix}")
+                    if (layout.net6.isNotEmpty()) remote.add("${layout.net6}/${layout.prefix6}")
+                    for (a in layout.aliasRoutes) remote.add("$a/32")
+                    for (a in layout.aliasRoutes6) remote.add("$a/128")
                     sh("$netsh advfirewall firewall delete rule name=\"$RULE_NET\"")
                     if (gen != netSetupGen) return@Thread
-                    sh("$netsh advfirewall firewall add rule name=\"$RULE_NET\" dir=in action=allow protocol=any profile=any remoteip=${subnets.joinToString(",")}")
+                    val ruleOk = sh("$netsh advfirewall firewall add rule name=\"$RULE_NET\" dir=in action=allow protocol=any profile=any remoteip=${remote.joinToString(",")}")
+                    // Everything that arrives through the adapter, whatever its source address: the list above misses
+                    // addresses of devices that joined later, and only the adapter itself decides what a game may see.
+                    sh("$netsh advfirewall firewall delete rule name=\"$RULE_IFACE\"")
+                    val ifaceOk = sh("$ps \"New-NetFirewallRule -DisplayName '$RULE_IFACE' -Direction Inbound -Action Allow -Profile Any -InterfaceAlias '${WinTun.ADAPTER_NAME}' | Out-Null\"")
                     val exe = ProcessHandle.current().info().command().orElse(null)
                     if (exe != null && !exe.lowercase().endsWith("\\java.exe") && !exe.lowercase().endsWith("\\javaw.exe")) {
                         sh("$netsh advfirewall firewall delete rule name=\"$RULE_PROGRAM\"")
                         sh("$netsh advfirewall firewall add rule name=\"$RULE_PROGRAM\" dir=in action=allow protocol=udp profile=any program=\"$exe\"")
                     }
-                    sh("$netsh interface ipv4 set interface name=\"${WinTun.ADAPTER_NAME}\" weakhostreceive=enabled weakhostsend=enabled")
-                    if (layout.my6.isNotEmpty()) {
-                        sh("$netsh interface ipv6 set interface name=\"${WinTun.ADAPTER_NAME}\" weakhostreceive=enabled weakhostsend=enabled")
+                    Native.note(
+                        "брандмауэр: правило по адресам " + (if (ruleOk) "добавлено (${remote.size} адресов и сетей)" else "НЕ добавлено") +
+                            "; правило для всего адаптера " + (if (ifaceOk) "добавлено" else "НЕ добавлено"),
+                    )
+                    // Weak host model: the PC answers a packet addressed to another of its addresses (a real one that a
+                    // phone mirrors) through the adapter. The interface name is a positional argument: the keyword
+                    // differs between "ipv4" (name=) and "ipv6" (interface=), PowerShell is the fallback.
+                    for (family in listOf("ipv4", "ipv6")) {
+                        if (family == "ipv6" && layout.my6.isEmpty()) continue
+                        if (gen != netSetupGen) return@Thread
+                        val ok = sh("$netsh interface $family set interface \"${WinTun.ADAPTER_NAME}\" weakhostreceive=enabled weakhostsend=enabled")
+                        if (!ok) {
+                            val fam = if (family == "ipv4") "IPv4" else "IPv6"
+                            val fb = sh("$ps \"Set-NetIPInterface -InterfaceAlias '${WinTun.ADAPTER_NAME}' -AddressFamily $fam -WeakHostSend Enabled -WeakHostReceive Enabled\"")
+                            Native.note("weak host $fam: " + (if (fb) "включён через PowerShell" else "НЕ включён"))
+                        } else {
+                            Native.note("weak host $family: включён")
+                        }
                     }
                     // A new adapter is a "public" network until Windows has identified it; this takes a few seconds.
-                    val ps = "\"${WinTun.system32("WindowsPowerShell\\v1.0\\powershell.exe")}\""
-                    val cmd = "$ps -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command " +
-                        "\"Get-NetConnectionProfile -InterfaceAlias '${WinTun.ADAPTER_NAME}' | Set-NetConnectionProfile -NetworkCategory Private\""
+                    val cmd = "$ps \"Get-NetConnectionProfile -InterfaceAlias '${WinTun.ADAPTER_NAME}' | Set-NetConnectionProfile -NetworkCategory Private\""
+                    var private = false
                     for (i in 0 until 8) {
                         if (gen != netSetupGen || stopping.get()) return@Thread
-                        if (WinTun.exec(cmd, 20000).first == 0) break
+                        if (WinTun.exec(cmd, 20000).first == 0) {
+                            private = true
+                            break
+                        }
                         Thread.sleep(2500)
                     }
+                    Native.note("сеть адаптера: " + (if (private) "частная" else "профиль не изменён (остаётся общедоступной)"))
                 } catch (_: InterruptedException) {
                 } catch (t: Throwable) {
                     Native.note("настройка брандмауэра: ${t.message}")
@@ -192,6 +225,7 @@ class TunnelVpnService {
                 val netsh = "\"${WinTun.system32("netsh.exe")}\""
                 WinTun.exec("$netsh advfirewall firewall delete rule name=\"$RULE_NET\"", 15000)
                 WinTun.exec("$netsh advfirewall firewall delete rule name=\"$RULE_PROGRAM\"", 15000)
+                WinTun.exec("$netsh advfirewall firewall delete rule name=\"$RULE_IFACE\"", 15000)
             } catch (_: Throwable) {
             }
         }
@@ -308,3 +342,4 @@ class TunnelVpnService {
 
 private const val RULE_NET = "LanBridge virtual network"
 private const val RULE_PROGRAM = "LanBridge program"
+private const val RULE_IFACE = "LanBridge adapter"

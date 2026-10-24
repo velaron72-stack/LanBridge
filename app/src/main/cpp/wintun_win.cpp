@@ -217,6 +217,110 @@ DWORD setInterface(const NET_LUID& luid, ADDRESS_FAMILY fam, int mtu, int metric
     return SetIpInterfaceEntry(&row);
 }
 
+
+// ------------------------------------------------------------------ host routes
+
+// Addresses that a host route through the adapter must never take over.
+struct Sensitive {
+    std::vector<IN_ADDR> v4;
+    std::vector<IN6_ADDR> v6;
+    void add(const SOCKADDR* sa) {
+        if (!sa) return;
+        if (sa->sa_family == AF_INET) v4.push_back(reinterpret_cast<const SOCKADDR_IN*>(sa)->sin_addr);
+        else if (sa->sa_family == AF_INET6) v6.push_back(reinterpret_cast<const SOCKADDR_IN6*>(sa)->sin6_addr);
+    }
+    bool has(const IN_ADDR& a) const {
+        for (const IN_ADDR& x : v4)
+            if (x.S_un.S_addr == a.S_un.S_addr) return true;
+        return false;
+    }
+    bool has(const IN6_ADDR& a) const {
+        for (const IN6_ADDR& x : v6)
+            if (memcmp(&x, &a, sizeof a) == 0) return true;
+        return false;
+    }
+};
+
+// This PC's own addresses on its other adapters, and the gateways and DNS servers of all adapters.
+void collectSensitive(const NET_LUID& ours, Sensitive& out) {
+    PMIB_UNICASTIPADDRESS_TABLE t = nullptr;
+    if (GetUnicastIpAddressTable(AF_UNSPEC, &t) == NO_ERROR && t) {
+        for (ULONG i = 0; i < t->NumEntries; i++) {
+            const MIB_UNICASTIPADDRESS_ROW& r = t->Table[i];
+            if (r.InterfaceLuid.Value == ours.Value) continue;
+            if (r.Address.si_family == AF_INET) out.v4.push_back(r.Address.Ipv4.sin_addr);
+            else if (r.Address.si_family == AF_INET6) out.v6.push_back(r.Address.Ipv6.sin6_addr);
+        }
+        FreeMibTable(t);
+    }
+    ULONG len = 16384;
+    std::vector<BYTE> buf;
+    ULONG rc = ERROR_BUFFER_OVERFLOW;
+    for (int tries = 0; tries < 4 && rc == ERROR_BUFFER_OVERFLOW; tries++) {
+        buf.assign(len, 0);
+        rc = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
+                                  nullptr, reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data()), &len);
+    }
+    if (rc != NO_ERROR) return;
+    for (PIP_ADAPTER_ADDRESSES aa = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data()); aa; aa = aa->Next) {
+        if (aa->Luid.Value == ours.Value) continue;
+        for (PIP_ADAPTER_GATEWAY_ADDRESS g = aa->FirstGatewayAddress; g; g = g->Next) out.add(g->Address.lpSockaddr);
+        for (PIP_ADAPTER_DNS_SERVER_ADDRESS d = aa->FirstDnsServerAddress; d; d = d->Next) out.add(d->Address.lpSockaddr);
+    }
+}
+
+bool unusable4(const IN_ADDR& a) {
+    uint32_t h = ntohl(a.S_un.S_addr);
+    uint8_t b0 = (uint8_t)(h >> 24), b1 = (uint8_t)(h >> 16);
+    return h == 0 || b0 == 127 || b0 >= 224 || (b0 == 169 && b1 == 254);
+}
+
+bool unusable6(const IN6_ADDR& a) {
+    const uint8_t* b = a.u.Byte;
+    static const uint8_t zero[16] = {0};
+    if (memcmp(b, zero, 16) == 0) return true;                    // ::
+    if (memcmp(b, zero, 15) == 0 && b[15] == 1) return true;      // ::1
+    if (b[0] == 0xff) return true;                                // multicast
+    if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) return true;       // link-local
+    return false;
+}
+
+// Removes the manual routes that an earlier configure() put on the adapter.
+void clearRoutes(const NET_LUID& luid) {
+    PMIB_IPFORWARD_TABLE2 t = nullptr;
+    if (GetIpForwardTable2(AF_UNSPEC, &t) != NO_ERROR || !t) return;
+    for (ULONG i = 0; i < t->NumEntries; i++) {
+        MIB_IPFORWARD_ROW2& r = t->Table[i];
+        if (r.InterfaceLuid.Value != luid.Value) continue;
+        if (r.Protocol != MIB_IPPROTO_NETMGMT) continue;
+        DeleteIpForwardEntry2(&r);
+    }
+    FreeMibTable(t);
+}
+
+// A route to one address, on-link through the adapter: replies to that address go into the tunnel.
+DWORD addHostRoute(const NET_LUID& luid, int family, const void* addr) {
+    MIB_IPFORWARD_ROW2 r;
+    InitializeIpForwardEntry(&r);
+    r.InterfaceLuid = luid;
+    r.DestinationPrefix.Prefix.si_family = (ADDRESS_FAMILY)family;
+    if (family == AF_INET) {
+        memcpy(&r.DestinationPrefix.Prefix.Ipv4.sin_addr, addr, sizeof(IN_ADDR));
+        r.DestinationPrefix.PrefixLength = 32;
+    } else {
+        memcpy(&r.DestinationPrefix.Prefix.Ipv6.sin6_addr, addr, sizeof(IN6_ADDR));
+        r.DestinationPrefix.PrefixLength = 128;
+    }
+    r.NextHop.si_family = (ADDRESS_FAMILY)family;  // the rest stays zero: no gateway, the address is on the link
+    r.Metric = 0;
+    r.Protocol = (NL_ROUTE_PROTOCOL)MIB_IPPROTO_NETMGMT;
+    r.Origin = NlroManual;
+    r.ValidLifetime = 0xffffffffu;
+    r.PreferredLifetime = 0xffffffffu;
+    r.Immortal = TRUE;
+    return CreateIpForwardEntry2(&r);
+}
+
 }  // namespace
 
 // ------------------------------------------------------------------ strings
@@ -396,6 +500,52 @@ std::string configure(const IpConfig& c) {
         }
         DWORD e = setInterface(luid, AF_INET6, c.mtu < 1280 ? 1280 : c.mtu, c.metric);
         if (e != NO_ERROR) addLine(out, "W:", "параметры интерфейса IPv6 (MTU, метрика): " + winErr(e));
+    }
+
+    // Host routes to the real addresses of the other devices.
+    clearRoutes(luid);
+    if (!c.alias4.empty() || !c.alias6.empty()) {
+        Sensitive sens;
+        collectSensitive(luid, sens);
+        std::string added;
+        for (const std::string& t : c.alias4) {
+            IN_ADDR a;
+            if (!parseV4(t, a)) {
+                addLine(out, "W:", "неверный реальный адрес IPv4: " + t);
+                continue;
+            }
+            if (t == c.ip4) continue;
+            if (unusable4(a) || sens.has(a)) {
+                addLine(out, "W:", "маршрут до " + t + " не создан: это адрес этого ПК, шлюз, DNS или служебный адрес");
+                continue;
+            }
+            DWORD e = addHostRoute(luid, AF_INET, &a);
+            if (e != NO_ERROR && e != ERROR_OBJECT_ALREADY_EXISTS)
+                addLine(out, "W:", "маршрут до " + t + " не создан: " + winErr(e));
+            else
+                added += t + " ";
+        }
+        for (const std::string& t : c.alias6) {
+            IN6_ADDR a;
+            if (!parseV6(t, a)) {
+                addLine(out, "W:", "неверный реальный адрес IPv6: " + t);
+                continue;
+            }
+            if (!c.ip6.empty()) {
+                IN6_ADDR mine;
+                if (parseV6(c.ip6, mine) && memcmp(&mine, &a, sizeof a) == 0) continue;
+            }
+            if (unusable6(a) || sens.has(a)) {
+                addLine(out, "W:", "маршрут до " + t + " не создан: это адрес этого ПК, шлюз, DNS или служебный адрес");
+                continue;
+            }
+            DWORD e = addHostRoute(luid, AF_INET6, &a);
+            if (e != NO_ERROR && e != ERROR_OBJECT_ALREADY_EXISTS)
+                addLine(out, "W:", "маршрут до " + t + " не создан: " + winErr(e));
+            else
+                added += t + " ";
+        }
+        if (!added.empty()) addLine(out, "I:", "маршруты к реальным адресам друзей через адаптер: " + added);
     }
     return out;
 }

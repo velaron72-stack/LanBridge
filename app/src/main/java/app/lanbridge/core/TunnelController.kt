@@ -580,24 +580,54 @@ object TunnelController {
             _ui.update { it.copy(friend = null, friendError = null) }
             return
         }
-        val blob = OfferCodec.extract(text)
-        if (blob == null) {
+        val readings = OfferCodec.candidates(text)
+        if (readings.isEmpty()) {
             friendBlob = null
+            logFriendText("в тексте (${text.length} симв.) кода нет")
             val msg = if (OfferCodec.isLegacy(text)) {
                 "Код от версии 1.x. Обновите приложение у обоих и создайте коды заново"
             } else {
-                "В тексте нет кода (он начинается с ${OfferCodec.GROUP_PREFIX} или ${OfferCodec.PREFIX})"
+                "В тексте нет кода (он начинается с ${OfferCodec.GROUP_PREFIX} или ${OfferCodec.PREFIX}). " +
+                    "Скопируйте код целиком, вместе с началом, или отсканируйте QR"
             }
             _ui.update { it.copy(friend = null, friendError = msg) }
             return
         }
-        val d = Native.kv(Native.describeOffer(blob))
-        val rc = d["code"]?.toIntOrNull() ?: 1
-        if (rc != 0) {
+        // The text may hold more than one reading (a code split over lines, words after it, two codes): the core checks
+        // the length and the checksum, so the first reading that is a whole code wins. A code that is only expired, own or
+        // of another kind is still a whole code and gets its own message.
+        var blob: ByteArray? = null
+        var d: Map<String, String> = emptyMap()
+        var rc = 1
+        var chars = 0
+        for (pass in 0..1) {
+            for (r in readings) {
+                val dd = Native.kv(Native.describeOffer(r.blob))
+                val code = dd["code"]?.toIntOrNull() ?: 1
+                val whole = code != 1 && code != 2
+                if ((pass == 0 && code == 0) || (pass == 1 && whole)) {
+                    blob = r.blob; d = dd; rc = code; chars = r.chars
+                    break
+                }
+            }
+            if (blob != null) break
+        }
+        if (blob == null) {
+            // Nothing is a whole code: report the reading that got furthest (its length fits, only the sum is wrong).
+            val best = readings.map { r -> r to (Native.kv(Native.describeOffer(r.blob))["code"]?.toIntOrNull() ?: 1) }
+                .let { l -> l.firstOrNull { it.second == 2 } ?: l.first() }
             friendBlob = null
-            _ui.update { it.copy(friend = null, friendError = offerErrorText(rc)) }
+            logFriendText("прочитано ${best.first.chars} симв. кода, ошибка ${best.second}")
+            _ui.update { it.copy(friend = null, friendError = offerErrorText(best.second, best.first.chars)) }
             return
         }
+        if (rc != 0) {
+            friendBlob = null
+            logFriendText("код найден (${chars} симв.), ошибка $rc")
+            _ui.update { it.copy(friend = null, friendError = offerErrorText(rc, chars)) }
+            return
+        }
+        logFriendText("код принят (${chars} симв., в тексте ${text.length})")
         val isGroup = d["group"] == "1"
         val cur = _ui.value
         if (isGroup != (cur.mode == Mode.GROUP)) {
@@ -645,9 +675,18 @@ object TunnelController {
         _ui.update { it.copy(friend = f, friendError = null) }
     }
 
-    private fun offerErrorText(rc: Int): String = when (rc) {
-        1 -> "Код повреждён или обрезан"
-        2 -> "Код повреждён: не сошлась контрольная сумма"
+    private var lastFriendLog = ""
+
+    /** One line in the log per change of the verdict on the pasted text, so that a rejected code can be explained later. */
+    private fun logFriendText(what: String) {
+        if (what == lastFriendLog) return
+        lastFriendLog = what
+        Native.note("код друга: $what")
+    }
+
+    private fun offerErrorText(rc: Int, chars: Int = 0): String = when (rc) {
+        1 -> "Код повреждён или обрезан" + (if (chars > 0) " (прочитано $chars символов после начала). Скопируйте его целиком или отсканируйте QR" else "")
+        2 -> "Код повреждён: не сошлась контрольная сумма" + (if (chars > 0) " ($chars символов). Скопируйте код заново целиком или отсканируйте QR" else "")
         3 -> "Код истёк — пусть создаст новый"
         4 -> "Это ваш собственный код"
         5 -> "Код создан другой сборкой приложения (в сборке 20005 появились группы). Установите одну и ту же свежую сборку у всех и создайте коды заново"

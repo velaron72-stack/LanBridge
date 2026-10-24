@@ -79,6 +79,11 @@ tasks.register("checkNativeFiles") {
     }
 }
 
+// An installer or app image without the two libraries would start and then fail: refuse to build one.
+tasks.matching { it.name in setOf("createDistributable", "packageExe", "packageMsi") }.configureEach {
+    dependsOn("checkNativeFiles")
+}
+
 compose.desktop {
     application {
         mainClass = "app.lanbridge.MainKt"
@@ -96,6 +101,7 @@ compose.desktop {
 
             windows {
                 iconFile.set(layout.projectDirectory.file("icons/lanbridge.ico"))
+                menu = true
                 menuGroup = "LanBridge"
                 shortcut = true
                 dirChooser = true

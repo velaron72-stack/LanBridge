@@ -132,6 +132,8 @@ int main() {
         wintun::IpConfig c;
         c.ip4 = "10.77.1.2";
         c.ip6 = "fd00::2";
+        c.alias4 = {"192.0.2.77", "not-an-address"};
+        c.alias6 = {"fd00::77"};
         std::string res = wintun::configure(c);
         CHECK(!res.empty());
         printf("  %s", res.c_str());

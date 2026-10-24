@@ -142,8 +142,8 @@ jobs:
   pc-app:
     name: PC app (Windows 10/11 x64)
     needs: pc-native
-    runs-on: windows-latest
-    timeout-minutes: 45
+    runs-on: windows-2022
+    timeout-minutes: 60
     defaults:
       run:
         shell: pwsh
@@ -231,14 +231,58 @@ jobs:
           path: LanBridge-PC-portable.zip
           if-no-files-found: error
 
-      - name: Build the installer (non-blocking, needs WiX on the runner)
-        continue-on-error: true
+      - name: WiX Toolset 3 (jpackage needs it for the .exe installer)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Find-Wix {
+            $c = Get-Command candle.exe -ErrorAction SilentlyContinue
+            if ($c) { return (Split-Path $c.Source) }
+            $d = Get-ChildItem 'C:\Program Files (x86)' -Directory -Filter 'WiX Toolset v3*' -ErrorAction SilentlyContinue |
+              Sort-Object Name -Descending | Select-Object -First 1
+            if ($d -and (Test-Path (Join-Path $d.FullName 'bin\candle.exe'))) { return (Join-Path $d.FullName 'bin') }
+            return $null
+          }
+          $bin = Find-Wix
+          if (-not $bin) {
+            choco install wixtoolset -y --no-progress
+            $bin = Find-Wix
+          }
+          if (-not $bin) { throw 'WiX Toolset 3 not found' }
+          Write-Host "WiX: $bin"
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+
+      - name: Build the installer (one .exe)
         working-directory: desktop
         run: gradle packageExe --no-daemon --stacktrace
+
+      - name: Installer file
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Get-ChildItem 'desktop\build\compose\binaries\main\exe' -Filter *.exe | Select-Object -First 1
+          if (-not $exe) { throw 'the installer .exe was not built' }
+          Get-Item $exe.FullName | Select-Object Name, Length
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: LanBridge-PC-installer
+          name: LanBridge-Setup
           path: desktop/build/compose/binaries/main/exe/*.exe
-          if-no-files-found: ignore
+          if-no-files-found: error
+
+      - name: Silent install and smoke test of the installed app (non-blocking)
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Get-ChildItem 'desktop\build\compose\binaries\main\exe' -Filter *.exe | Select-Object -First 1).FullName
+          $p = Start-Process $setup -ArgumentList '/quiet' -Wait -PassThru
+          Write-Host ('installer exit code: ' + $p.ExitCode)
+          $dir = 'C:\Program Files\LanBridge'
+          $app = Join-Path $dir 'LanBridge.exe'
+          if (-not (Test-Path $app)) { throw "not installed: $app" }
+          foreach ($n in 'lanbridge.dll', 'wintun.dll') {
+            if (-not (Get-ChildItem $dir -Recurse -Filter $n)) { throw "$n is missing in $dir" }
+          }
+          $out = Join-Path $env:RUNNER_TEMP 'check-installed.txt'
+          $q = Start-Process $app -ArgumentList '--check', '--check-out', $out -Wait -PassThru
+          if (Test-Path $out) { Get-Content $out }
+          if ($q.ExitCode -ne 0) { throw ('installed app check failed, exit code ' + $q.ExitCode) }

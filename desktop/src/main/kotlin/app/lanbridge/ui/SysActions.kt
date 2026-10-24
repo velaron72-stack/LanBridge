@@ -44,7 +44,7 @@ object SysActions {
     @Suppress("UNUSED_PARAMETER")
     fun versionName(ctx: Context): String = props.getProperty("versionName") ?: ""
 
-    /** "2.1.0 (сборка 20005)": all devices must run the same build. */
+    /** "2.1.1 (сборка 20006)": all devices must run the same build. */
     fun versionLabel(ctx: Context): String = "${versionName(ctx)} (сборка ${props.getProperty("versionCode") ?: "?"})"
 
     @Suppress("UNUSED_PARAMETER")

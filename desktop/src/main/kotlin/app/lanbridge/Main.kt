@@ -102,7 +102,7 @@ private fun selfCheck(args: Array<String>): Int {
                 code = 3
             } else {
                 say("adapter: ok, fd=$fd")
-                val r = WinTun.configure("10.77.9.2", 24, "fd77:9::2", 64, 1500, 1)
+                val r = WinTun.configure("10.77.9.2", 24, "fd77:9::2", 64, 1500, 1, "192.0.2.77", "")
                 say("configure: ${r.trim()}")
                 if (r.lineSequence().any { it.startsWith("E:") }) code = 3
                 say("stats: ${WinTun.stats()}")
