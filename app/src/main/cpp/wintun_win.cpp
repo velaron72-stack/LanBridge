@@ -547,6 +547,19 @@ std::string configure(const IpConfig& c) {
         }
         if (!added.empty()) addLine(out, "I:", "маршруты к реальным адресам друзей через адаптер: " + added);
     }
+
+    // The limited broadcast (255.255.255.255, where games look for servers on the LAN) leaves through the adapter that
+    // has the best route to it. Every adapter has its own on-link route for it, and a LAN card or another virtual
+    // network can win: a route of this adapter with metric 0 makes it the one.
+    if (!c.ip4.empty()) {
+        IN_ADDR bc;
+        bc.S_un.S_addr = 0xFFFFFFFFu;
+        DWORD e = addHostRoute(luid, AF_INET, &bc);
+        if (e != NO_ERROR && e != ERROR_OBJECT_ALREADY_EXISTS)
+            addLine(out, "W:", "маршрут для 255.255.255.255 не создан: " + winErr(e));
+        else
+            addLine(out, "I:", "широковещательные пакеты (255.255.255.255) идут через адаптер");
+    }
     return out;
 }
 

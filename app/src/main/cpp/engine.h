@@ -39,6 +39,8 @@ struct Config {
     int memberReapMs = 90000;  // the creator drops a member it has not heard from for this long
     int joinTimeoutMs = 30000; // a newcomer gives up when the creator does not let it in
     int joinGraceS = 120;      // the creator still admits newcomers this long after the code's expiry (clock skew)
+    // false: the code of this device asks the others not to mirror its real addresses (see Offer::noMirror).
+    bool mirrorReal = true;
 };
 
 // Layout of the int64 array returned by Engine::status()

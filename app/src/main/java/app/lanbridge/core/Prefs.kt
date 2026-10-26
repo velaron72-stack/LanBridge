@@ -76,7 +76,20 @@ class Prefs(context: Context) {
             sp.edit().putBoolean("hintMailbox", v).apply()
         }
 
+    /**
+     * PC only: may the app switch Windows Firewall off while the tunnel is open? [FIREWALL_ASK] = the user has not been
+     * asked yet, [FIREWALL_OFF] = yes (the previous state comes back when the tunnel closes), [FIREWALL_KEEP] = no.
+     */
+    var firewallMode: Int
+        get() = sp.getInt("firewallMode", FIREWALL_ASK).coerceIn(FIREWALL_ASK, FIREWALL_KEEP)
+        set(v) {
+            sp.edit().putInt("firewallMode", v.coerceIn(FIREWALL_ASK, FIREWALL_KEEP)).apply()
+        }
+
     companion object {
+        const val FIREWALL_ASK = 0
+        const val FIREWALL_OFF = 1
+        const val FIREWALL_KEEP = 2
         const val DEFAULT_MTU = 1500
         const val AVATAR_MAX = 12288
         const val DEFAULT_STUN = "stun.l.google.com:19302\n" +

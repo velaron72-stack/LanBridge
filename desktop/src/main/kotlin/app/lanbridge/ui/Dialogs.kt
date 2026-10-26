@@ -44,6 +44,7 @@ import app.lanbridge.core.AvatarUtil
 import app.lanbridge.core.Native
 import app.lanbridge.core.Prefs
 import app.lanbridge.core.TunnelController
+import app.lanbridge.vpn.TunnelVpnService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -94,8 +95,13 @@ private const val HELP_TEXT =
         "сервер не в той сети: на время игры их лучше отключить.\n" +
         "• Программа должна работать от имени администратора (запрос Windows при запуске): без этого адаптер " +
         "не создаётся.\n" +
-        "• Брандмауэр Windows: программа сама добавляет правило для виртуальной сети. Если игра не видит " +
-        "друга, проверьте, не блокирует ли её сторонний антивирус.\n\n" +
+        "• Брандмауэр Windows: программа сама добавляет правила для виртуальной сети, включает weak host на " +
+        "адаптере и делает сеть адаптера частной. Если игра всё равно не видит друга, включите в настройках " +
+        "«Отключать брандмауэр Windows, пока туннель открыт»: брандмауэр выключается при подключении и " +
+        "возвращается при отключении или закрытии окна. Если программа была убита и не запускалась снова, " +
+        "брандмауэр вернётся при следующем запуске LanBridge (или включите его вручную в «Безопасность Windows»). " +
+        "Антивирус Windows и сторонние брандмауэры и антивирусы программа не трогает; если игру блокирует " +
+        "сторонний антивирус, отключите его сами.\n\n" +
         "Если игра не стартует\n" +
         "На всех устройствах откройте «Журнал и потоки» (значок с ключом) и нажмите «Сбросить потоки». " +
         "Запустите игру, дождитесь зависания и снова откройте «Журнал и потоки» → «Копировать». Там видно, " +
@@ -116,6 +122,46 @@ private const val HELP_TEXT =
         "Работа на ПК\n" +
         "Окно можно свернуть: туннель работает, пока программа запущена. Закрытие окна отключает туннель и " +
         "удаляет адаптер. Пока туннель открыт, компьютер не уходит в сон (можно выключить в настройках)."
+
+/**
+ * The question about Windows Firewall, asked once (the answer is kept in the settings). "No" is the default
+ * choice: closing the window by Esc or a click outside does not answer.
+ */
+@Composable
+fun FirewallDialog(onAnswer: (Boolean) -> Unit) {
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text("Отключить брандмауэр Windows?") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "Брандмауэр Windows часто не пускает игры через виртуальную сеть. LanBridge может сам " +
+                        "выключить его, пока туннель открыт, и включить обратно при отключении или закрытии окна.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    "Да: брандмауэр выключается на время работы туннеля, все три профиля (доменный, частный, " +
+                        "общедоступный). До этого его состояние сохраняется и потом восстанавливается.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    "Нет: ничего не меняется. Программа только добавляет разрешающие правила для своей сети.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    "Пока брандмауэр выключен, компьютер не защищён от входящих подключений из сети. Если " +
+                        "программу убить и больше не запускать, брандмауэр останется выключенным до следующего запуска " +
+                        "LanBridge: тогда он включится сам, или включите его вручную. Антивирус Windows и сторонние " +
+                        "программы защиты не затрагиваются. Выбор можно изменить в настройках.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = { onAnswer(false) }) { Text("Нет") } },
+        dismissButton = { TextButton(onClick = { onAnswer(true) }) { Text("Да, отключать") } },
+    )
+}
 
 /** Shown on every launch of the app. */
 @Composable
@@ -164,6 +210,8 @@ fun SettingsDialog(onDismiss: () -> Unit) {
     var ttl by remember { mutableStateOf(prefs.ttlMin.toString()) }
     var awake by remember { mutableStateOf(prefs.keepAwake) }
     var hint by remember { mutableStateOf(prefs.hintMailbox) }
+    val firewallWas = remember { prefs.firewallMode == Prefs.FIREWALL_OFF }
+    var firewall by remember { mutableStateOf(firewallWas) }
 
     fun pickAvatar() {
         val f = SysActions.pickImage("Фото для аватара") ?: return
@@ -190,6 +238,11 @@ fun SettingsDialog(onDismiss: () -> Unit) {
                 prefs.ttlMin = ttl.trim().toIntOrNull() ?: 10
                 prefs.keepAwake = awake
                 prefs.hintMailbox = hint
+                if (firewall != firewallWas) {
+                    prefs.firewallMode = if (firewall) Prefs.FIREWALL_OFF else Prefs.FIREWALL_KEEP
+                    // applied at once when the tunnel is open
+                    TunnelVpnService.applyFirewallChoice()
+                }
                 // the name and the avatar go to the other participants right away, also while connected
                 TunnelController.applyProfile()
                 onDismiss()
@@ -267,6 +320,18 @@ fun SettingsDialog(onDismiss: () -> Unit) {
                         modifier = Modifier.weight(1f),
                     )
                     Switch(checked = awake, onCheckedChange = { awake = it })
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Отключать брандмауэр Windows, пока туннель открыт", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "Брандмауэр выключается при подключении и возвращается при отключении или закрытии окна. " +
+                                "Нужно, только если игра не видит друга при включённом брандмауэре.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(checked = firewall, onCheckedChange = { firewall = it })
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {

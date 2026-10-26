@@ -115,6 +115,7 @@ GroupNets computeGroupNets(uint32_t net4, const Ip6& net6, int mySlot, const Off
     for (const GroupMemberRef& m : others) count(*m.offer);
 
     auto collect4 = [&](const Offer& from, const Offer& installer, std::vector<uint32_t>& out) {
+        if (from.noMirror) return;
         for (const Candidate& c : from.cands) {
             if (c.type != 0 || c.v6 || out.size() >= 4) continue;
             if (cnt4[c.ip] != 1 || !aliasUsable4(c.ip, installer, net4)) continue;
@@ -122,6 +123,7 @@ GroupNets computeGroupNets(uint32_t net4, const Ip6& net6, int mySlot, const Off
         }
     };
     auto collect6 = [&](const Offer& from, const Offer& installer, std::vector<Ip6>& out) {
+        if (from.noMirror) return;
         for (const Ip6& a : from.v6) {
             if (out.size() >= 3 || cnt6[a] != 1 || !aliasUsable6(a, installer, net6)) continue;
             if (std::find(out.begin(), out.end(), a) == out.end()) out.push_back(a);

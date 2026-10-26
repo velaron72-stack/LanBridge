@@ -10,7 +10,6 @@ import java.net.MulticastSocket
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
-import java.net.SocketTimeoutException
 import java.util.Locale
 import java.util.zip.CRC32
 
@@ -238,25 +237,45 @@ object LanSelfTest {
 
         val ok = LinkedHashMap<String, Long>()
         val err = HashMap<String, String>()
-        var s: MulticastSocket? = null
+        // One socket per address that is probed. The tunnel remembers for every flow (local port, remote address and
+        // port) which address of this device the other side wrote to, and answers from it, as IP_PKTINFO would. Two
+        // probes from one socket to two addresses of this device (the virtual one and a real one) would be one flow
+        // for it, and the replies of the first would come from the address of the second.
+        val socks = LinkedHashMap<String, MulticastSocket>()
+        val replies = java.util.concurrent.ConcurrentLinkedQueue<Pair<DatagramPacket, Long>>()
         try {
-            val sock = MulticastSocket()
-            s = sock
-            sock.broadcast = true
-            sock.soTimeout = 40
             val ni = findIface(layout.my)
-            if (ni != null) {
-                try {
-                    sock.networkInterface = ni
-                } catch (_: Exception) {
+            for (p in probes) {
+                if (socks.containsKey(p.host)) continue
+                val sock = MulticastSocket()
+                socks[p.host] = sock
+                sock.broadcast = true
+                if (ni != null) {
+                    try {
+                        sock.networkInterface = ni
+                    } catch (_: Exception) {
+                    }
                 }
+                val rx = Thread({
+                    val buf = ByteArray(2000)
+                    try {
+                        while (!sock.isClosed) {
+                            val pkt = DatagramPacket(buf, buf.size)
+                            sock.receive(pkt)
+                            val copy = DatagramPacket(pkt.data.copyOf(pkt.length), pkt.length, pkt.address, pkt.port)
+                            replies.add(copy to SystemClock.elapsedRealtime())
+                        }
+                    } catch (_: Exception) {
+                    }
+                }, "lanbridge-check-rx")
+                rx.isDaemon = true
+                rx.start()
             }
             val id = (SystemClock.elapsedRealtime() % 100000L).toString()
             val sentAt = HashMap<String, Long>()
             val rounds = longArrayOf(0L, 250L, 600L)
             var nextRound = 0
             val t0 = SystemClock.elapsedRealtime()
-            val buf = ByteArray(2000)
             while (true) {
                 val now = SystemClock.elapsedRealtime()
                 if (now - t0 > 3000L || ok.size >= probes.size) break
@@ -268,17 +287,17 @@ object LanSelfTest {
                         val data = head + body
                         sentAt["${p.key}#$nextRound"] = SystemClock.elapsedRealtime()
                         try {
-                            sock.send(DatagramPacket(data, data.size, p.target, PORT))
+                            socks[p.host]?.send(DatagramPacket(data, data.size, p.target, PORT))
                         } catch (e: Exception) {
                             err[p.key] = e.message ?: e.javaClass.simpleName
                         }
                     }
                     nextRound++
                 }
-                try {
-                    val pkt = DatagramPacket(buf, buf.size)
-                    sock.receive(pkt)
-                    val at = SystemClock.elapsedRealtime()
+                var got = false
+                while (true) {
+                    val (pkt, at) = replies.poll() ?: break
+                    got = true
                     if (isSelf(layout, pkt.address.hostAddress)) continue
                     val parts = String(pkt.data, 0, pkt.length, Charsets.UTF_8).split(' ', limit = 6)
                     if (parts.size >= 5 && parts[0] == "LBR1" && parts[1] == id) {
@@ -294,15 +313,22 @@ object LanSelfTest {
                             ok[key] = at - (sentAt["$key#${parts[3]}"] ?: t0)
                         }
                     }
-                } catch (_: SocketTimeoutException) {
+                }
+                if (!got) {
+                    try {
+                        Thread.sleep(5)
+                    } catch (_: InterruptedException) {
+                    }
                 }
             }
         } catch (e: Exception) {
             return "Проверка не выполнена: ${e.message}"
         } finally {
-            try {
-                s?.close()
-            } catch (_: Exception) {
+            for (sock in socks.values) {
+                try {
+                    sock.close()
+                } catch (_: Exception) {
+                }
             }
         }
         val sb = StringBuilder("Проверка LAN")

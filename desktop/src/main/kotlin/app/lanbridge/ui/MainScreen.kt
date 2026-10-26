@@ -58,6 +58,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.lanbridge.core.Mode
 import app.lanbridge.core.Phase
+import app.lanbridge.core.Prefs
 import app.lanbridge.core.TunnelController
 import app.lanbridge.core.UiState
 import app.lanbridge.core.WinTun
@@ -73,6 +74,8 @@ fun MainScreen() {
     val ui by TunnelController.ui.collectAsState()
     var sheet by remember { mutableStateOf(Sheet.NONE) }
     var showStartup by rememberSaveable { mutableStateOf(true) }
+    // the question about Windows Firewall is asked once, after the start notice
+    var askFirewall by remember { mutableStateOf(Prefs(ctx).firewallMode == Prefs.FIREWALL_ASK) }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var groupAutoStarted by rememberSaveable { mutableStateOf(false) }
     val snack = remember { SnackbarHostState() }
@@ -249,9 +252,21 @@ fun MainScreen() {
         )
     }
 
+    if (askFirewall && !showStartup && sheet == Sheet.NONE) {
+        FirewallDialog { off ->
+            Prefs(ctx).firewallMode = if (off) Prefs.FIREWALL_OFF else Prefs.FIREWALL_KEEP
+            askFirewall = false
+            TunnelVpnService.applyFirewallChoice()
+        }
+    }
+
     when (sheet) {
         Sheet.HELP -> HelpDialog { sheet = Sheet.NONE }
-        Sheet.SETTINGS -> SettingsDialog { sheet = Sheet.NONE }
+        Sheet.SETTINGS -> SettingsDialog {
+            sheet = Sheet.NONE
+            // settings may have answered the question
+            askFirewall = Prefs(ctx).firewallMode == Prefs.FIREWALL_ASK
+        }
         Sheet.LOG -> LogDialog { sheet = Sheet.NONE }
         Sheet.QR -> {
             val code = ui.myCode

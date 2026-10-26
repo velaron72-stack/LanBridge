@@ -54,7 +54,7 @@ bool offerEncode(const Offer& o, std::vector<uint8_t>& out) {
     if (o.group && (o.gthird == 0 || o.gthird == 255 || o.gmax < 2 || o.gmax > 8)) return false;
     std::string name = o.name.substr(0, kMaxName);
     out.push_back(o.group ? kOfferVersionGroup : kOfferVersion);
-    out.push_back(o.group ? 1 : 0);  // flags: bit 0 = group code
+    out.push_back((uint8_t)((o.group ? 1 : 0) | (o.noMirror ? 2 : 0)));  // flags: bit 0 = group code, bit 1 = no mirroring
     uint8_t b4[4];
     putBe32(b4, o.expiresAt);
     out.insert(out.end(), b4, b4 + 4);
@@ -103,6 +103,7 @@ int offerDecode(const uint8_t* p, size_t n, Offer& o) {
     size_t pos = 2;
     Offer r;
     r.version = p[0];
+    r.noMirror = (p[1] & 2) != 0;
     r.expiresAt = be32(p + pos);
     pos += 4;
     memcpy(r.pub, p + pos, 32);
@@ -238,6 +239,7 @@ Layout computeLayout(const Offer& mine, const Offer& peer) {
 
     auto aliasOk = [&](uint32_t ip, const Offer& installer) { return aliasUsable4(ip, installer, l.net); };
     auto collect = [&](const Offer& from, const Offer& installer, std::vector<uint32_t>& out) {
+        if (from.noMirror) return;
         for (const Candidate& c : from.cands) {
             if (c.type != 0 || c.v6 || out.size() >= 4) continue;
             if (!aliasOk(c.ip, installer)) continue;
@@ -271,6 +273,7 @@ Layout computeLayout(const Offer& mine, const Offer& peer) {
     }
     auto aliasOk6 = [&](const Ip6& a, const Offer& installer) { return aliasUsable6(a, installer, l.net6); };
     auto collect6 = [&](const Offer& from, const Offer& installer, std::vector<Ip6>& out) {
+        if (from.noMirror) return;
         for (const Ip6& a : from.v6) {
             if (out.size() >= 3 || !aliasOk6(a, installer)) continue;
             bool dup = false;

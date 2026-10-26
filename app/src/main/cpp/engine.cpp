@@ -433,6 +433,7 @@ int Engine::prepareCommon(bool group, const std::vector<std::string>& stunServer
     o.nat = (uint8_t)nat;
     o.name = sanitize(deviceName, 24);
     o.port6 = s.s6 ? s.s6->port() : 0;
+    o.noMirror = !s.cfg.mirrorReal;
     std::vector<uint32_t> seen;
     for (const std::string& t : localIps) {
         uint32_t ip;

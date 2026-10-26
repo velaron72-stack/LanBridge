@@ -30,7 +30,7 @@ object SysActions {
         ""
     }
 
-    /** "2.1.1 (сборка 20006)": both phones must run the same build. */
+    /** "2.2.0 (сборка 20008)": both phones must run the same build. */
     @Suppress("DEPRECATION")
     fun versionLabel(ctx: Context): String = try {
         val pi = ctx.packageManager.getPackageInfo(ctx.packageName, 0)

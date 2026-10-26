@@ -2,6 +2,7 @@ package app.lanbridge.vpn
 
 import android.content.Context
 import android.content.Intent
+import app.lanbridge.core.FirewallGuard
 import app.lanbridge.core.Native
 import app.lanbridge.core.NetLayout
 import app.lanbridge.core.Phase
@@ -44,6 +45,15 @@ class TunnelVpnService {
 
         /** The one-line state of the tunnel, for the window title. */
         fun statusText(ui: UiState): String = impl.describe(ui)
+
+        /**
+         * The user's choice about Windows Firewall has changed (the question at the start, the settings): applied at once
+         * when the tunnel is open, otherwise at its next start. Choosing "keep" also puts back what an earlier run switched off.
+         */
+        fun applyFirewallChoice() = impl.applyFirewallChoice()
+
+        /** At the start of the app: puts the firewall back if an earlier run ended without doing it. */
+        fun recoverFirewall() = impl.recoverFirewall()
     }
 
     private class Impl {
@@ -59,6 +69,9 @@ class TunnelVpnService {
 
         @Volatile
         private var netSetupGen = 0
+
+        /** Serialises the changes of the firewall state: the choice of the user and the end of the tunnel. */
+        private val firewallLock = Any()
 
         val isRunning: Boolean get() = started.get()
 
@@ -109,6 +122,7 @@ class TunnelVpnService {
                 }
                 if (prefs.keepAwake) WinTun.keepAwake(true)
                 setupNetworkAsync(layout)
+                applyFirewallChoice()
                 startWatcher()
             } catch (t: Throwable) {
                 Native.note("запуск туннеля: ${t.message}")
@@ -158,9 +172,28 @@ class TunnelVpnService {
         private fun setupNetworkAsync(layout: NetLayout) {
             val gen = ++netSetupGen
             val t = Thread({
+                // Another layout or a stop replaced this setup: whatever is left to do belongs to the newer one.
+                fun stale(): Boolean = gen != netSetupGen || stopping.get()
                 try {
                     val netsh = "\"${WinTun.system32("netsh.exe")}\""
                     val ps = "\"${WinTun.system32("WindowsPowerShell\\v1.0\\powershell.exe")}\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command"
+                    val name = WinTun.ADAPTER_NAME
+                    // Weak host model first (it decides whether the game works at all): the PC answers a packet that
+                    // arrives through the adapter for another of its addresses. The interface name is a positional
+                    // argument: the keyword differs between "ipv4" (name=) and "ipv6" (interface=). PowerShell is the
+                    // fallback.
+                    for (family in listOf("ipv4", "ipv6")) {
+                        if (family == "ipv6" && layout.my6.isEmpty()) continue
+                        if (stale()) return@Thread
+                        val ok = sh("$netsh interface $family set interface \"$name\" weakhostreceive=enabled weakhostsend=enabled")
+                        if (!ok) {
+                            val fam = if (family == "ipv4") "IPv4" else "IPv6"
+                            val fb = sh("$ps \"Set-NetIPInterface -InterfaceAlias '$name' -AddressFamily $fam -WeakHostSend Enabled -WeakHostReceive Enabled\"")
+                            Native.note("weak host $fam: " + (if (fb) "включён через PowerShell" else "НЕ включён"))
+                        } else {
+                            Native.note("weak host $family: включён")
+                        }
+                    }
                     // Who may send to this PC through the adapter: the virtual subnets and the real addresses of the
                     // other devices (a phone's packets carry its real address as the source).
                     val remote = ArrayList<String>()
@@ -168,42 +201,39 @@ class TunnelVpnService {
                     if (layout.net6.isNotEmpty()) remote.add("${layout.net6}/${layout.prefix6}")
                     for (a in layout.aliasRoutes) remote.add("$a/32")
                     for (a in layout.aliasRoutes6) remote.add("$a/128")
+                    if (stale()) return@Thread
                     sh("$netsh advfirewall firewall delete rule name=\"$RULE_NET\"")
-                    if (gen != netSetupGen) return@Thread
                     val ruleOk = sh("$netsh advfirewall firewall add rule name=\"$RULE_NET\" dir=in action=allow protocol=any profile=any remoteip=${remote.joinToString(",")}")
                     // Everything that arrives through the adapter, whatever its source address: the list above misses
-                    // addresses of devices that joined later, and only the adapter itself decides what a game may see.
+                    // addresses of devices that joined later. Windows may not know a new adapter by its name for a few
+                    // seconds, so this is tried again.
                     sh("$netsh advfirewall firewall delete rule name=\"$RULE_IFACE\"")
-                    val ifaceOk = sh("$ps \"New-NetFirewallRule -DisplayName '$RULE_IFACE' -Direction Inbound -Action Allow -Profile Any -InterfaceAlias '${WinTun.ADAPTER_NAME}' | Out-Null\"")
+                    var ifaceOk = false
+                    for (i in 0 until 5) {
+                        if (stale()) break
+                        ifaceOk = sh("$ps \"New-NetFirewallRule -DisplayName '$RULE_IFACE' -Direction Inbound -Action Allow -Profile Any -InterfaceAlias '$name' | Out-Null\"")
+                        if (ifaceOk) break
+                        Thread.sleep(2000)
+                    }
                     val exe = ProcessHandle.current().info().command().orElse(null)
-                    if (exe != null && !exe.lowercase().endsWith("\\java.exe") && !exe.lowercase().endsWith("\\javaw.exe")) {
+                    if (!stale() && exe != null && !exe.lowercase().endsWith("\\java.exe") && !exe.lowercase().endsWith("\\javaw.exe")) {
                         sh("$netsh advfirewall firewall delete rule name=\"$RULE_PROGRAM\"")
                         sh("$netsh advfirewall firewall add rule name=\"$RULE_PROGRAM\" dir=in action=allow protocol=udp profile=any program=\"$exe\"")
+                    }
+                    if (stopping.get()) {
+                        // the tunnel was closed while the rules were being added: nothing may stay behind
+                        removeFirewallRules()
+                        return@Thread
                     }
                     Native.note(
                         "брандмауэр: правило по адресам " + (if (ruleOk) "добавлено (${remote.size} адресов и сетей)" else "НЕ добавлено") +
                             "; правило для всего адаптера " + (if (ifaceOk) "добавлено" else "НЕ добавлено"),
                     )
-                    // Weak host model: the PC answers a packet addressed to another of its addresses (a real one that a
-                    // phone mirrors) through the adapter. The interface name is a positional argument: the keyword
-                    // differs between "ipv4" (name=) and "ipv6" (interface=), PowerShell is the fallback.
-                    for (family in listOf("ipv4", "ipv6")) {
-                        if (family == "ipv6" && layout.my6.isEmpty()) continue
-                        if (gen != netSetupGen) return@Thread
-                        val ok = sh("$netsh interface $family set interface \"${WinTun.ADAPTER_NAME}\" weakhostreceive=enabled weakhostsend=enabled")
-                        if (!ok) {
-                            val fam = if (family == "ipv4") "IPv4" else "IPv6"
-                            val fb = sh("$ps \"Set-NetIPInterface -InterfaceAlias '${WinTun.ADAPTER_NAME}' -AddressFamily $fam -WeakHostSend Enabled -WeakHostReceive Enabled\"")
-                            Native.note("weak host $fam: " + (if (fb) "включён через PowerShell" else "НЕ включён"))
-                        } else {
-                            Native.note("weak host $family: включён")
-                        }
-                    }
                     // A new adapter is a "public" network until Windows has identified it; this takes a few seconds.
-                    val cmd = "$ps \"Get-NetConnectionProfile -InterfaceAlias '${WinTun.ADAPTER_NAME}' | Set-NetConnectionProfile -NetworkCategory Private\""
+                    val cmd = "$ps \"Get-NetConnectionProfile -InterfaceAlias '$name' | Set-NetConnectionProfile -NetworkCategory Private\""
                     var private = false
                     for (i in 0 until 8) {
-                        if (gen != netSetupGen || stopping.get()) return@Thread
+                        if (stale()) return@Thread
                         if (WinTun.exec(cmd, 20000).first == 0) {
                             private = true
                             break
@@ -218,6 +248,58 @@ class TunnelVpnService {
             }, "lanbridge-firewall")
             t.isDaemon = true
             t.start()
+        }
+
+        // ------------------------------------------------------------------ Windows Firewall on/off (the user's choice)
+
+        fun applyFirewallChoice() {
+            val t = Thread({
+                try {
+                    synchronized(firewallLock) {
+                        val off = Prefs(Context()).firewallMode == Prefs.FIREWALL_OFF
+                        if (!off) {
+                            FirewallGuard.restore().takeIf { it.isNotEmpty() }?.let { Native.note(it) }
+                        } else if (started.get() && !stopping.get()) {
+                            if (WinTun.isElevated()) Native.note(FirewallGuard.disable())
+                            else Native.note("брандмауэр: нужны права администратора, не трогаю")
+                            // the tunnel was closed while the firewall was being switched: it goes back at once
+                            if (stopping.get()) FirewallGuard.restore().takeIf { it.isNotEmpty() }?.let { Native.note(it) }
+                        }
+                        // chosen "off" but the tunnel is not open: it is switched when the tunnel starts
+                    }
+                } catch (t: Throwable) {
+                    Native.note("брандмауэр: ${t.message}")
+                }
+            }, "lanbridge-fw-choice")
+            t.isDaemon = true
+            t.start()
+        }
+
+        fun recoverFirewall() {
+            val t = Thread({
+                try {
+                    synchronized(firewallLock) {
+                        if (!started.get() && FirewallGuard.hasPendingRestore() && WinTun.isElevated()) {
+                            Native.note("брандмауэр: прошлый запуск не вернул его, возвращаю")
+                            FirewallGuard.restore().takeIf { it.isNotEmpty() }?.let { Native.note(it) }
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Native.note("брандмауэр: ${t.message}")
+                }
+            }, "lanbridge-fw-recover")
+            t.isDaemon = true
+            t.start()
+        }
+
+        /** The end of the tunnel: the firewall is as the user had it (also after a crash of an earlier run). */
+        private fun restoreFirewall() {
+            try {
+                synchronized(firewallLock) {
+                    FirewallGuard.restore().takeIf { it.isNotEmpty() }?.let { Native.note(it) }
+                }
+            } catch (_: Throwable) {
+            }
         }
 
         private fun removeFirewallRules() {
@@ -306,6 +388,7 @@ class TunnelVpnService {
             } catch (_: Throwable) {
             }
             removeFirewallRules()
+            restoreFirewall()
             TunnelController.onTunnelStopped()
             started.set(false)
         }

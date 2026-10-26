@@ -129,6 +129,7 @@ fun main(args: Array<String>) {
     val problem = boot(args)
     if (problem == null) {
         TunnelController.init(Context())
+        TunnelVpnService.recoverFirewall()
         Runtime.getRuntime().addShutdownHook(Thread({ TunnelVpnService.shutdownBlocking() }, "lanbridge-exit"))
     }
     val icon = try {

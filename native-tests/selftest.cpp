@@ -829,6 +829,59 @@ static void testFragReassembler() {
 }
 
 // ------------------------------------------------------------------ offer v3 (IPv6) and layout
+static void testNoMirror() {
+    printf("[offer] flag \"do not mirror my real addresses\" (Windows PC)\n");
+    auto ip4 = [](uint32_t a_, uint32_t b_, uint32_t c_, uint32_t d_) { return (a_ << 24) | (b_ << 16) | (c_ << 8) | d_; };
+    auto A6 = [](const char* t) {
+        Ip6 a;
+        CHECK(parseIp6(t, a));
+        return a;
+    };
+    KeyPair ka, kb;
+    crypto::genKeypair(ka.priv, ka.pub);
+    crypto::genKeypair(kb.priv, kb.pub);
+    Offer phone, pc;
+    memcpy(phone.pub, ka.pub, 32);
+    memcpy(pc.pub, kb.pub, 32);
+    phone.expiresAt = pc.expiresAt = (uint32_t)(wallMs() / 1000 + 600);
+    phone.name = "phone";
+    pc.name = "pc";
+    phone.cands.push_back(Candidate{0, ip4(192, 168, 1, 8), 4000});
+    pc.cands.push_back(Candidate{0, ip4(26, 111, 136, 131), 4001});
+    pc.cands.push_back(Candidate{0, ip4(192, 168, 2, 114), 4001});
+    phone.v6.push_back(A6("2001:db8:a::5"));
+    pc.v6.push_back(A6("fdfd::1a6f:8883"));
+    phone.port6 = 4002;
+    pc.port6 = 4003;
+
+    // the flag survives the code, and a code without it still decodes as before
+    std::vector<uint8_t> blob;
+    Offer d;
+    pc.noMirror = true;
+    CHECK(offerEncode(pc, blob) && offerDecode(blob.data(), blob.size(), d) == OFFER_OK && d.noMirror && !d.group);
+    CHECK(blob[1] == 2);
+    pc.noMirror = false;
+    CHECK(offerEncode(pc, blob) && offerDecode(blob.data(), blob.size(), d) == OFFER_OK && !d.noMirror && blob[1] == 0);
+    pc.group = true;
+    pc.gsecret[0] = 7;
+    pc.gthird = 77;
+    pc.gmax = 8;
+    pc.noMirror = true;
+    CHECK(offerEncode(pc, blob) && offerDecode(blob.data(), blob.size(), d) == OFFER_OK && d.noMirror && d.group && blob[1] == 3);
+    pc.group = false;
+
+    // direct mode: the PC's addresses are not mirrored in either direction of the computation, the phone's are
+    Layout lp = computeLayout(phone, pc), lc = computeLayout(pc, phone);
+    CHECK(lp.aliasPeer.empty() && lp.aliasPeer6.empty());  // the phone routes nothing of the PC
+    CHECK(lc.aliasMine.empty() && lc.aliasMine6.empty());  // and the PC keeps nothing as its own mirrored address
+    CHECK((lc.aliasPeer == std::vector<uint32_t>{ip4(192, 168, 1, 8)}));  // the PC still routes the phone's address
+    CHECK(lp.aliasMine == lc.aliasPeer && lp.aliasMine6 == lc.aliasPeer6);  // both sides agree
+    CHECK((lc.aliasPeer6 == std::vector<Ip6>{A6("2001:db8:a::5")}));
+    pc.noMirror = false;
+    Layout lp2 = computeLayout(phone, pc);
+    CHECK(lp2.aliasPeer.size() == 2 && lp2.aliasPeer6.size() == 1);  // without the flag nothing changes
+}
+
 static void testOfferV6() {
     printf("[offer] version 4, IPv6 layout\n");
     auto ip4 = [](uint32_t a_, uint32_t b_, uint32_t c_, uint32_t d_) { return (a_ << 24) | (b_ << 16) | (c_ << 8) | d_; };
@@ -1724,6 +1777,7 @@ int main(int argc, char** argv) {
     testIpv6Helpers();
     testFragReassembler();
     testOfferV6();
+    testNoMirror();
     testStun();
     testApiMisuse();
     for (int i = 0; i < 4; i++) testEngine(i);

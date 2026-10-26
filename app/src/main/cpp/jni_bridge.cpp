@@ -12,7 +12,16 @@
 namespace {
 
 lb::Engine& engine() {
-    static lb::Engine* e = new lb::Engine();  // lives for the whole process
+    static lb::Engine* e = [] {
+        lb::Engine* x = new lb::Engine();  // lives for the whole process
+#ifdef _WIN32
+        // A Windows PC does not take part in the mirroring of real addresses (see Offer::noMirror).
+        lb::Config c;
+        c.mirrorReal = false;
+        x->setConfig(c);
+#endif
+        return x;
+    }();
     return *e;
 }
 

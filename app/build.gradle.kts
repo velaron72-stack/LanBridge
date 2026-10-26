@@ -17,8 +17,8 @@ android {
         applicationId = "app.lanbridge"
         minSdk = 26
         targetSdk = 34
-        versionCode = 20006
-        versionName = "2.1.1"
+        versionCode = 20008
+        versionName = "2.2.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")

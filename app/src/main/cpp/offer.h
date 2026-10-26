@@ -33,6 +33,10 @@ struct Offer {
     std::string name;        // device name, at most 24 bytes
     std::vector<Candidate> cands;  // explicit candidates, IPv4 and IPv6 (at most 12)
     std::vector<Ip6> v6;     // global/ULA IPv6 addresses of the device (at most 3), mirrored like the real IPv4 ones
+    // Flags bit 1: the device does not want its real addresses mirrored through the tunnel (they stay usable as
+    // candidates). A Windows PC sets it: it cannot answer from an address of another adapter over the tunnel adapter
+    // reliably, and games do not need it, the virtual address is enough. Builds that do not know the bit ignore it.
+    bool noMirror = false;
     // Port of the device's IPv6 socket (0: no IPv6 socket). Every address of `v6` together with this port is an
     // implicit IPv6 host candidate, so these addresses do not have to be written twice into the code.
     uint16_t port6 = 0;
