@@ -18,10 +18,22 @@ import java.util.zip.CRC32
  * (UDP and TCP). "Проверка LAN" sends them to the friend and reports what came back: unicast to the virtual and to the
  * mirrored real address (IPv4 and IPv6), limited and directed broadcast, multicast, UDP datagrams that the tunnel
  * has to cut into chunks or the network stack has to fragment, and a TCP transfer. The result shows which kinds of
- * traffic really cross the tunnel.
+ * traffic really cross the tunnel. It also asks the other device the way the server list of a GoldSrc / Xash3D game
+ * does (see [GAME_PORTS]) and says whether a game server answers there.
  */
 object LanSelfTest {
     const val PORT = 41377
+
+    /** The ports a Half-Life / CS 1.6 / Xash3D server browser asks on the LAN: the default server port and the nine after it. */
+    private val GAME_PORTS = 27015..27024
+
+    /** Query of the Source / GoldSrc server browser ("A2S_INFO") and of the Xash3D LAN browser ("info" + protocol 49). */
+    private val A2S_INFO = byteArrayOf(-1, -1, -1, -1) + "TSource Engine Query".toByteArray(Charsets.US_ASCII) + byteArrayOf(0)
+    private val XASH_INFO = byteArrayOf(-1, -1, -1, -1) + "info 49".toByteArray(Charsets.US_ASCII)
+
+    /** Extra lines for the end of the report from the platform (the PC lists the programs that listen on the game ports). */
+    @Volatile
+    var extraReport: (() -> String)? = null
     private const val MCAST = "239.255.77.77"
     private const val BIG = 4000
     private const val MID = 1400
@@ -186,6 +198,63 @@ object LanSelfTest {
         }
     }
 
+    /** A packet that arrived at the socket of [via] (the address it was sent to). */
+    private class Rx(val pkt: DatagramPacket, val at: Long, val via: String)
+
+    /** One answer of a game server: where it came from, to which query, what it says. */
+    private class GameAnswer(val from: String, val port: Int, val viaBroadcast: Boolean, val text: String)
+
+    private fun printable(d: ByteArray, from: Int): String {
+        val sb = StringBuilder()
+        var i = from
+        while (i < d.size && sb.length < 100) {
+            val c = d[i].toInt() and 0xFF
+            sb.append(if (c in 32..126) c.toChar() else if (c == 10 || c == 0) ' ' else '?')
+            i++
+        }
+        return sb.toString().trim()
+    }
+
+    /** Reads an answer to A2S_INFO ("I" of Source, "m" of old GoldSrc, "A" = a challenge is wanted), or a text answer of Xash3D. */
+    internal fun describeGameReply(d: ByteArray): String? {
+        if (d.size < 6 || d[0] != (-1).toByte() || d[1] != (-1).toByte() || d[2] != (-1).toByte() || d[3] != (-1).toByte()) return null
+        var i = 5
+        fun str(): String {
+            val st = i
+            while (i < d.size && d[i] != 0.toByte()) i++
+            val r = printable(d.copyOfRange(st, minOf(i, d.size)), 0)
+            i++
+            return r
+        }
+        fun byte(): Int = if (i < d.size) (d[i++].toInt() and 0xFF) else 0
+        return when (d[4].toInt() and 0xFF) {
+            0x49 -> {
+                val proto = byte()
+                val name = str()
+                val map = str()
+                str()
+                val game = str()
+                i += 2
+                val pl = byte()
+                val mx = byte()
+                "ответ Source/GoldSrc: «$name», карта $map, игра $game, игроков $pl/$mx, протокол $proto"
+            }
+            0x6D -> {
+                str()
+                val name = str()
+                val map = str()
+                str()
+                val game = str()
+                val pl = byte()
+                val mx = byte()
+                val proto = byte()
+                "ответ GoldSrc: «$name», карта $map, игра $game, игроков $pl/$mx, протокол $proto"
+            }
+            0x41 -> "сервер ответил и просит challenge (новый протокол Source)"
+            else -> "ответ: " + printable(d, 4)
+        }
+    }
+
     private class Probe(val key: String, val label: String, val host: String, val body: Int, val unicast: Boolean = false) {
         val target: InetAddress by lazy { InetAddress.getByName(host) }  // always an IP literal, never a name lookup
     }
@@ -216,6 +285,26 @@ object LanSelfTest {
         }
     }
 
+    private fun gameReport(layout: NetLayout, answers: List<GameAnswer>): String {
+        val head = "Сервер игры (CS 1.6 / Xash3D / HL, запрос как у списка LAN, порты ${GAME_PORTS.first}–${GAME_PORTS.last})"
+        if (answers.isEmpty()) {
+            return "$head — нет ответа. На другом устройстве сервер не создан, не слушает эти порты или принимает пакеты только " +
+                "на одном из адресов компьютера. Туннель при этом может быть исправен: сервер отвечает только когда он запущен."
+        }
+        val sb = StringBuilder("$head:")
+        for (a in answers) {
+            sb.append("\n  ").append(a.from).append(':').append(a.port).append(if (a.viaBroadcast) " (на широковещательный запрос) — " else " (на прямой запрос) — ").append(a.text)
+        }
+        val direct = answers.any { !it.viaBroadcast }
+        val broad = answers.any { it.viaBroadcast }
+        if (direct && !broad) {
+            sb.append("\n  Прямой запрос на ${layout.peer} проходит, а широковещательный (как у списка LAN) нет: подключайтесь командой connect ${layout.peer}.")
+        } else if (direct && broad) {
+            sb.append("\n  Сервер виден и прямым, и широковещательным запросом: в списке LAN он должен появиться.")
+        }
+        return sb.toString()
+    }
+
     /** Blocking, up to about ten seconds. Call from a background thread. */
     fun run(layout: NetLayout): String {
         val probes = ArrayList<Probe>()
@@ -242,7 +331,11 @@ object LanSelfTest {
         // probes from one socket to two addresses of this device (the virtual one and a real one) would be one flow
         // for it, and the replies of the first would come from the address of the second.
         val socks = LinkedHashMap<String, MulticastSocket>()
-        val replies = java.util.concurrent.ConcurrentLinkedQueue<Pair<DatagramPacket, Long>>()
+        val replies = java.util.concurrent.ConcurrentLinkedQueue<Rx>()
+        val gameAnswers = ArrayList<GameAnswer>()
+        val gameTargets = ArrayList<Pair<String, Boolean>>()  // address, broadcast?
+        if (layout.peer.isNotEmpty()) gameTargets += layout.peer to false
+        gameTargets += "255.255.255.255" to true
         try {
             val ni = findIface(layout.my)
             for (p in probes) {
@@ -256,6 +349,7 @@ object LanSelfTest {
                     } catch (_: Exception) {
                     }
                 }
+                val via = p.host
                 val rx = Thread({
                     val buf = ByteArray(2000)
                     try {
@@ -263,7 +357,7 @@ object LanSelfTest {
                             val pkt = DatagramPacket(buf, buf.size)
                             sock.receive(pkt)
                             val copy = DatagramPacket(pkt.data.copyOf(pkt.length), pkt.length, pkt.address, pkt.port)
-                            replies.add(copy to SystemClock.elapsedRealtime())
+                            replies.add(Rx(copy, SystemClock.elapsedRealtime(), via))
                         }
                     } catch (_: Exception) {
                     }
@@ -278,7 +372,8 @@ object LanSelfTest {
             val t0 = SystemClock.elapsedRealtime()
             while (true) {
                 val now = SystemClock.elapsedRealtime()
-                if (now - t0 > 3000L || ok.size >= probes.size) break
+                // the game servers get time to answer even when every probe of the check has been answered
+                if (now - t0 > 3000L || (ok.size >= probes.size && now - t0 > 1200L)) break
                 if (nextRound < rounds.size && now - t0 >= rounds[nextRound]) {
                     for (p in probes) {
                         if (ok.containsKey(p.key)) continue
@@ -292,13 +387,44 @@ object LanSelfTest {
                             err[p.key] = e.message ?: e.javaClass.simpleName
                         }
                     }
+                    if (nextRound < 2) {
+                        for ((host, bc) in gameTargets) {
+                            val sock = socks[host] ?: continue
+                            val target = try {
+                                InetAddress.getByName(host)
+                            } catch (_: Exception) {
+                                continue
+                            }
+                            for (port in GAME_PORTS) {
+                                for (q in listOf(A2S_INFO, XASH_INFO)) {
+                                    try {
+                                        sock.send(DatagramPacket(q, q.size, target, port))
+                                    } catch (_: Exception) {
+                                    }
+                                }
+                            }
+                        }
+                    }
                     nextRound++
                 }
                 var got = false
                 while (true) {
-                    val (pkt, at) = replies.poll() ?: break
+                    val rx = replies.poll() ?: break
+                    val pkt = rx.pkt
+                    val at = rx.at
                     got = true
                     if (isSelf(layout, pkt.address.hostAddress)) continue
+                    if (pkt.length >= 5 && pkt.data[0] == (-1).toByte()) {
+                        val text = describeGameReply(pkt.data.copyOf(pkt.length))
+                        if (text != null) {
+                            val bc = gameTargets.any { it.first == rx.via && it.second }
+                            val from = pkt.address.hostAddress ?: "?"
+                            if (gameAnswers.none { it.from == from && it.port == pkt.port && it.viaBroadcast == bc && it.text == text }) {
+                                gameAnswers.add(GameAnswer(from, pkt.port, bc, text))
+                            }
+                        }
+                        continue
+                    }
                     val parts = String(pkt.data, 0, pkt.length, Charsets.UTF_8).split(' ', limit = 6)
                     if (parts.size >= 5 && parts[0] == "LBR1" && parts[1] == id) {
                         val key = parts[2]
@@ -349,6 +475,13 @@ object LanSelfTest {
             sb.append("\nIPv6 TCP 256 КБ → ${layout.peer6} — ").append(tcpProbe(layout.peer6))
             if (real6 != null) sb.append("\nIPv6 TCP 256 КБ → $real6 — ").append(tcpProbe(real6))
         }
+        sb.append("\n").append(gameReport(layout, gameAnswers))
+        val extra = try {
+            extraReport?.invoke()
+        } catch (_: Exception) {
+            null
+        }
+        if (!extra.isNullOrBlank()) sb.append('\n').append(extra)
         if (ok.isEmpty()) sb.append("\nУбедитесь, что у другого участника тоже открыто соединение (статус «Подключено»).")
         return sb.toString()
     }

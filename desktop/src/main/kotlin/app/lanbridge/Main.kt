@@ -24,6 +24,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
+import app.lanbridge.core.CsPortReport
+import app.lanbridge.core.LanSelfTest
 import app.lanbridge.core.Native
 import app.lanbridge.core.NativeLib
 import app.lanbridge.core.TunnelController
@@ -130,6 +132,8 @@ fun main(args: Array<String>) {
     if (problem == null) {
         TunnelController.init(Context())
         TunnelVpnService.recoverFirewall()
+        // the check of the LAN also lists who listens on the game ports of this computer
+        LanSelfTest.extraReport = { CsPortReport.run() }
         Runtime.getRuntime().addShutdownHook(Thread({ TunnelVpnService.shutdownBlocking() }, "lanbridge-exit"))
     }
     val icon = try {
